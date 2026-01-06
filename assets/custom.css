@@ -1,0 +1,52 @@
+/* reserve room for a 60px-tall fixed footer */
+body {
+  padding-bottom: 100px;  /* ← adjust to your footer’s actual height */
+}
+/* Reduce font size on all tab labels */
+.tab--selected, .tab {
+    font-size: 12px !important;
+    padding: 3px 6px !important;
+}
+
+/* Optional: slightly reduce the height of the tab bar */
+.tab {
+    line-height: 1 !important;
+}
+/* Container for all 7 day cards */
+.day-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+/* Each day card column */
+.day-col {
+    /* Try to fit 7 per row on big screens */
+    flex: 1 1 calc(100% / 7 - 0.5rem);
+    max-width: calc(100% / 7 - 0.5rem);
+    min-width: 200px; /* prevents cards from becoming unreadably skinny */
+}
+
+/* Medium-ish screens: go to ~4 per row */
+@media (max-width: 1400px) {
+    .day-col {
+        flex: 1 1 calc(100% / 4 - 0.5rem);
+        max-width: calc(100% / 4 - 0.5rem);
+    }
+}
+
+/* Tablets: 2 per row */
+@media (max-width: 992px) {
+    .day-col {
+        flex: 1 1 calc(100% / 2 - 0.5rem);
+        max-width: calc(100% / 2 - 0.5rem);
+    }
+}
+
+/* Phones: full-width */
+@media (max-width: 576px) {
+    .day-col {
+        flex: 1 1 100%;
+        max-width: 100%;
+    }
+}
