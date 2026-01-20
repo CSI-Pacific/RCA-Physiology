@@ -15,12 +15,23 @@ from dash.exceptions import PreventUpdate
 import json
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
+
 import numpy as np
 import scipy as sp
 
 
 from auth_setup import auth
 from utils import fetch_options, fetch_profiles, fetch_profile
+
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas
+import io
+import base64
+from reportlab.lib.pagesizes import A4
+import tempfile
+from reportlab.lib.utils import ImageReader
 
 
 # Register this file as a page in the larger app
@@ -80,23 +91,34 @@ TABLE_COLUMNS = [
     {"name": "RPE", "id": "rpe", "type": "numeric"},
 ]
 
-#Threshold table
 
-THRESH_DEFAULT_ROWS = [{
-    "Threshold": 'TH1',
-    "Lactate": None,
-    "LaB": None, "LaA": None,
-    "PoB": None, "PoA": None,
-    "HrB": None, "HrA": None,
-}]
-
-THRESH_COLUMNS = [
-    {"name": "Threshold", "id": "threshold", "type": "text", "editable": False},
-    {"name": "Lactate", "id": "La_output", "type": "numeric", "editable": True},
-    {"name": "Power Output", "id": "pow_output", "type": "numeric", "editable": False},
-    {"name": "Split", "id": "split_output", "type": "numeric", "editable": False},
-    {"name": "HR Output", "id": "HR_output", "type": "numeric", "editable": False},
+#Zones Table
+ZONES_DEFAULT_ROWS = [
+    {"Zone": "Z1", "HR_low": None, "HR_high": None, "PO_low": None, "PO_high": None,
+     "Split_low": None, "Split_high": None, "Rate_low": None, "Rate_high": None, "Notes": ""},
+    {"Zone": "Z2", "HR_low": None, "HR_high": None, "PO_low": None, "PO_high": None,
+     "Split_low": None, "Split_high": None, "Rate_low": None, "Rate_high": None, "Notes": ""},
+    {"Zone": "Z3", "HR_low": None, "HR_high": None, "PO_low": None, "PO_high": None,
+     "Split_low": None, "Split_high": None, "Rate_low": None, "Rate_high": None, "Notes": ""},
+    {"Zone": "Z4", "HR_low": None, "HR_high": None, "PO_low": None, "PO_high": None,
+     "Split_low": None, "Split_high": None, "Rate_low": None, "Rate_high": None, "Notes": ""},
+    {"Zone": "Z5", "HR_low": None, "HR_high": None, "PO_low": None, "PO_high": None,
+     "Split_low": None, "Split_high": None, "Rate_low": None, "Rate_high": None, "Notes": ""},
 ]
+
+ZONES_COLUMNS = [
+    {"name": "Zone", "id": "Zone", "type": "text"},
+    {"name": "HR Low", "id": "HR_low", "type": "numeric"},
+    {"name": "HR High", "id": "HR_high", "type": "numeric"},
+    {"name": "PO Low (W)", "id": "PO_low", "type": "numeric"},
+    {"name": "PO High (W)", "id": "PO_high", "type": "numeric"},
+    {"name": "Split Low (s/500)", "id": "Split_low", "type": "numeric"},
+    {"name": "Split High (s/500)", "id": "Split_high", "type": "numeric"},
+    {"name": "Rate Low (spm)", "id": "Rate_low", "type": "numeric"},
+    {"name": "Rate High (spm)", "id": "Rate_high", "type": "numeric"},
+    {"name": "Notes", "id": "Notes", "type": "text"},
+]
+
 
 #Helpers
 
@@ -164,6 +186,154 @@ def add_poly_fit(fig, x, y, degree=2, name="Fit", color = 'red'):
         )
     )
     return fig
+
+def _first_numeric_in_rows(rows, keys):
+    """Return first numeric value found scanning rows for any of the given keys."""
+    rows = rows or []
+    for r in rows:
+        for k in keys:
+            v = to_float(r.get(k))
+            if v is not None:
+                return float(v)
+    return None
+
+def hr_at_lactate(df_steps, target_la):
+    """
+    Estimate HR at a target lactate value using linear interpolation on La->HR.
+    Returns None if insufficient data.
+    """
+    if df_steps is None or df_steps.empty:
+        return None
+
+    d = df_steps.copy()
+    d["La"] = pd.to_numeric(d.get("La"), errors="coerce")
+    d["HR"] = pd.to_numeric(d.get("HR"), errors="coerce")
+    d = d.dropna(subset=["La", "HR"]).sort_values("La")
+
+    if len(d) < 2:
+        return None
+
+    # Collapse duplicate lactate values (average HR for same La)
+    d = d.groupby("La", as_index=False)["HR"].mean().sort_values("La")
+
+    la = d["La"].to_numpy(dtype=float)
+    hr = d["HR"].to_numpy(dtype=float)
+
+    # If outside observed range, clamp to endpoints (safer than extrapolating wildly)
+    if target_la <= la.min():
+        return float(hr[0])
+    if target_la >= la.max():
+        return float(hr[-1])
+
+    # Linear interpolation
+    return float(np.interp(target_la, la, hr))
+
+def build_zones_from_lt(hr_lt1, hr_lt2, band=5.0):
+    """
+    Build simple 5-zone model using HR at LT1 and LT2 with +/- band bpm around thresholds.
+    """
+    if hr_lt1 is None or hr_lt2 is None:
+        return None
+
+    # Ensure ordering
+    hr_lt1 = float(hr_lt1)
+    hr_lt2 = float(hr_lt2)
+    if hr_lt2 < hr_lt1:
+        hr_lt1, hr_lt2 = hr_lt2, hr_lt1
+
+    z1_hi = max(0.0, hr_lt1 - band)
+    z2_lo = z1_hi
+    z2_hi = hr_lt1 + band
+    z3_lo = z2_hi
+    z3_hi = max(z3_lo, hr_lt2 - band)
+    z4_lo = z3_hi
+    z4_hi = hr_lt2 + band
+    z5_lo = z4_hi
+
+    zones = [
+        {"Zone": "Z1", "HR_low": None,      "HR_high": round(z1_hi, 0), "Notes": "Easy / recovery"},
+        {"Zone": "Z2", "HR_low": round(z2_lo, 0), "HR_high": round(z2_hi, 0), "Notes": "Endurance"},
+        {"Zone": "Z3", "HR_low": round(z3_lo, 0), "HR_high": round(z3_hi, 0), "Notes": "Tempo"},
+        {"Zone": "Z4", "HR_low": round(z4_lo, 0), "HR_high": round(z4_hi, 0), "Notes": "Threshold"},
+        {"Zone": "Z5", "HR_low": round(z5_lo, 0), "HR_high": None,      "Notes": "VO₂ / high intensity"},
+    ]
+    return zones
+
+def _interp_y_at_x(df, x_col, y_col, x_target):
+    """
+    Linear interpolation of y at x_target using df[x_col]->df[y_col].
+    - sorts by x_col
+    - averages duplicates
+    - clamps outside range to endpoints
+    """
+    if df is None or df.empty or x_target is None:
+        return None
+
+    d = df.copy()
+    d[x_col] = pd.to_numeric(d.get(x_col), errors="coerce")
+    d[y_col] = pd.to_numeric(d.get(y_col), errors="coerce")
+    d = d.dropna(subset=[x_col, y_col])
+    if len(d) < 2:
+        return None
+
+    # collapse duplicates
+    d = d.groupby(x_col, as_index=False)[y_col].mean().sort_values(x_col)
+
+    x = d[x_col].to_numpy(dtype=float)
+    y = d[y_col].to_numpy(dtype=float)
+
+    if x_target <= x.min():
+        return float(y[0])
+    if x_target >= x.max():
+        return float(y[-1])
+
+    return float(np.interp(float(x_target), x, y))
+
+def _zone_row_from_bounds(df_steps, zone_name, hr_low, hr_high, notes=""):
+    """
+    Build a zone row including HR, PO, Split, Rate bounds.
+    PO/rate are interpolated vs HR; split is computed from PO.
+    """
+    po_low = _interp_y_at_x(df_steps, "HR", "A_PO", hr_low) if hr_low is not None else None
+    po_high = _interp_y_at_x(df_steps, "HR", "A_PO", hr_high) if hr_high is not None else None
+
+    rate_low = _interp_y_at_x(df_steps, "HR", "rate", hr_low) if hr_low is not None else None
+    rate_high = _interp_y_at_x(df_steps, "HR", "rate", hr_high) if hr_high is not None else None
+
+    split_low_sec = estimate_split_seconds(po_low) if po_low is not None else None
+    split_high_sec = estimate_split_seconds(po_high) if po_high is not None else None
+
+    split_low = format_split_mmss(split_low_sec)
+    split_high = format_split_mmss(split_high_sec)
+
+    return {
+        "Zone": zone_name,
+        "HR_low": round(hr_low, 0) if hr_low is not None else None,
+        "HR_high": round(hr_high, 0) if hr_high is not None else None,
+        "PO_low": round(po_low, 1) if po_low is not None else None,
+        "PO_high": round(po_high, 1) if po_high is not None else None,
+        "Split_low": split_low,
+        "Split_high": split_high,
+        "Rate_low": round(rate_low, 1) if rate_low is not None else None,
+        "Rate_high": round(rate_high, 1) if rate_high is not None else None,
+        "Notes": notes or "",
+    }
+
+def format_split_mmss(split_seconds):
+    """
+    Convert split in seconds to mm:ss.ms (e.g. 112.34 -> '1:52.34')
+    """
+    if split_seconds is None:
+        return None
+
+    try:
+        total_seconds = float(split_seconds)
+    except Exception:
+        return None
+
+    minutes = int(total_seconds // 60)
+    seconds = total_seconds % 60
+    return f"{minutes}:{seconds:05.2f}"
 
 
 layout = dbc.Container(
@@ -269,13 +439,13 @@ layout = dbc.Container(
                                         md=4,
                                     ),
                                     dbc.Col(
-                                        dbc.Button("Download JSON", id="form-download-btn", color="info", outline=True, className="w-100"),
+                                        dbc.Button("Download CSV", id="form-download-btn", color="info", outline=True, className="w-100"),
                                         md=4,
                                     ),
                                 ],
                                 className="g-2",
                             ),
-                            dcc.Download(id="form-download-json"),
+                            dcc.Download(id="form-download-csv"),
                             html.Hr(),
                             dbc.Alert(id="form-status-msg", color="success", is_open=False),
                         ],
@@ -326,7 +496,7 @@ layout = dbc.Container(
         ),
 
         html.Hr(),
-        make_card("Submission Preview", html.Pre(id="form-preview", className="m-0")),
+        #make_card("Submission Preview", html.Pre(id="form-preview", className="m-0")),
         dcc.Store(id="form-last-payload"),
         ################
         html.Hr(),
@@ -348,35 +518,38 @@ layout = dbc.Container(
         ################
         html.Hr(),
         make_card(
-            "Lactate Threshold Table",
+            "HR Training Zones (from Lactate Thresholds)",
+            dash_table.DataTable(
+                id="zones-table",
+                data=ZONES_DEFAULT_ROWS,
+                columns=ZONES_COLUMNS,
+                editable=False,
+                style_table={"overflowX": "auto"},
+                style_cell={"padding": "8px", "fontFamily": "system-ui", "fontSize": 14},
+                style_header={"fontWeight": "600"},
+            ),
+        ),
+        ################
+        # The Generate Report button triggers the generation of the report
+        dcc.Store(id="report-generated", data=False),  # Track report generation status
+        dbc.Row(
             [
-                html.Div(
-                    [
-                        dbc.Button("Add row", id="thresh-add-row", color="success", size="sm", className="me-2"),
-                        dbc.Button("Delete selected", id="thresh-delete-rows", color="danger", size="sm", outline=True),
-                    ],
-                    className="mb-2",
-                ),
-                dash_table.DataTable(
-                    id="thresh-table",
-                    data=THRESH_DEFAULT_ROWS,
-                    columns=THRESH_COLUMNS,
-                    editable=True,              # only LaThreshold is editable (per-column)
-                    row_selectable="multi",
-                    selected_rows=[],
-                    page_action="native",
-                    page_size=6,
-                    style_table={"overflowX": "auto"},
-                    style_cell={"padding": "8px", "fontFamily": "system-ui", "fontSize": 14},
-                    style_header={"fontWeight": "600"},
+                dbc.Col(
+                    dbc.Button("Download HR Zone Data", id="form-download-zones-btn", color="primary", outline=True, className="w-100"),
+                    md=4,
                 ),
             ],
+            className="g-2",
         ),
 
-        ################
+        # dcc.Download component is responsible for handling the download
+        dcc.Download(id="form-download-zones-csv"),
+
     ],
     fluid=True,
-)
+    )
+
+
 
 @dash.callback(
     Output("form-name", "options"),  # Update the dropdown options for full name
@@ -536,7 +709,7 @@ def submit_or_reset(submit_clicks, reset_clicks, name, mass, status, notes, tabl
         "items": table_rows or [],
     }
     return payload, "Submitted successfully.", True
-
+'''
 @dash.callback(
     Output("form-preview", "children"),
     Input("form-last-payload", "data"),
@@ -545,22 +718,32 @@ def show_preview(payload):
     if not payload:
         return "Nothing submitted yet."
     return json.dumps(payload, indent=2)
-
+'''
 @dash.callback(
-    Output("form-download-json", "data"),
+    Output("form-download-csv", "data"),  # This will trigger the CSV download
     Input("form-download-btn", "n_clicks"),
-    State("form-last-payload", "data"),
-    prevent_initial_call=True,
+    State("form-items-table", "data"),  # Grab the table data to export as CSV
+    prevent_initial_call=True
 )
-def download_payload(_, payload):
-    if not payload:
-        return no_update
-    return dict(
-        content=json.dumps(payload, indent=2),
-        filename="form_submission.json",
-        type="application/json",
-    )
+def download_csv(n_clicks, rows):
+    if not n_clicks:
+        raise PreventUpdate
 
+    # Ensure rows is a list of dictionaries
+    if not isinstance(rows, list):
+        raise ValueError("Rows data should be a list of dictionaries")
+
+    # Convert the rows (table data) to a pandas DataFrame
+    try:
+        df = pd.DataFrame(rows)
+    except Exception as e:
+        raise ValueError(f"Error converting rows to DataFrame: {e}")
+
+    # Convert DataFrame to CSV (without index)
+    csv_data = df.to_csv(index=False)
+
+    # Return the data to be downloaded
+    return dict(content=csv_data, filename="form_submission.csv", type="text/csv")
 @dash.callback(
     Output("plot-la-vs-po", "figure"),
     Output("plot-hr-vs-po", "figure"),
@@ -646,108 +829,156 @@ def update_plots(rows):
     return fig_la, fig_hr, slope_txt, intercept_txt
 
 
-@dash.callback(
-    Output("thresh-table", "data"),
-    Output("thresh-table", "selected_rows"),
-    Input("thresh-add-row", "n_clicks"),
-    Input("thresh-delete-rows", "n_clicks"),
-    State("thresh-table", "data"),
-    State("thresh-table", "selected_rows"),
-    prevent_initial_call=True,
-)
-def modify_thresh_table(add_clicks, del_clicks, rows, selected_rows):
-    rows = rows or []
-    selected_rows = selected_rows or []
-
-    if ctx.triggered_id == "thresh-add-row":
-        rows.append({
-            "Threshold": None,
-            "Lactate": None, "Power Output": None,
-            "Split": None, "HR Output": None,
-        })
-        return rows, []
-
-    if ctx.triggered_id == "thresh-delete-rows":
-        if not selected_rows:
-            return no_update, no_update
-        keep = [r for i, r in enumerate(rows) if i not in set(selected_rows)]
-        return keep, []
-
-    return no_update, no_update
-
-
-def _clean_num(s):
-    return pd.to_numeric(s, errors="coerce")
 
 @dash.callback(
-    Output("thresh-table", "data", allow_duplicate=True),
-    Input("thresh-table", "data_timestamp"),
+    Output("zones-table", "data"),
     Input("form-items-table", "data"),
-    State("thresh-table", "data"),
-    prevent_initial_call=True,
 )
-def compute_threshold_table(_, step_rows, thresh_rows):
-    thresh_rows = thresh_rows or []
+def compute_zones(step_rows):
     step_rows = step_rows or []
-
     df = pd.DataFrame(step_rows)
-    if df.empty:
-        return no_update
 
-    # Need La, A_PO, HR
-    for c in ["La", "A_PO", "HR"]:
+    if df.empty:
+        return ZONES_DEFAULT_ROWS
+
+    # Ensure numeric cols exist
+    for c in ["HR", "La", "A_PO", "rate"]:
         if c not in df.columns:
             df[c] = None
+    df["HR"] = pd.to_numeric(df["HR"], errors="coerce")
+    df["La"] = pd.to_numeric(df["La"], errors="coerce")
+    df["A_PO"] = pd.to_numeric(df["A_PO"], errors="coerce")
+    df["rate"] = pd.to_numeric(df["rate"], errors="coerce")
 
-    df["La"] = _clean_num(df["La"])
-    df["A_PO"] = _clean_num(df["A_PO"])
-    df["HR"] = _clean_num(df["HR"])
+    # Keep only rows with HR + La (needed for threshold HR interpolation),
+    # but PO/rate interpolation will still work if those are present too.
+    df_la_hr = df.dropna(subset=["La", "HR"]).copy()
+    if len(df_la_hr) < 2:
+        # Not enough lactate+HR to estimate LT anchors -> fallback zones by observed HR range
+        hrmin = df["HR"].min()
+        hrmax = df["HR"].max()
+        if pd.isna(hrmin) or pd.isna(hrmax):
+            return ZONES_DEFAULT_ROWS
 
-    df = df.dropna(subset=["La", "A_PO", "HR"]).sort_values("La")
-    if df.empty:
-        # nothing to compute from
-        updated = []
-        for r in thresh_rows:
-            r = dict(r)
-            for k in ["LaB","LaA","PoB","PoA","HrB","HrA"]:
-                r[k] = None
-            updated.append(r)
-        return updated
+        # crude 5 equal bins as fallback
+        edges = np.linspace(float(hrmin), float(hrmax), 6)
+        zones = []
+        for i, zn in enumerate(["Z1", "Z2", "Z3", "Z4", "Z5"]):
+            low = edges[i]
+            high = edges[i+1] if i < 4 else None
+            zones.append(_zone_row_from_bounds(df, zn, low if i > 0 else None, high, notes="Fallback: HR-range bins"))
+        return zones
 
-    changed = False
-    updated = []
+    # ---- Set fixed LT lactate targets ----
+    lt1_la = 2.0  # Fixed LT1 = 2 mmol
+    lt2_la = 4.0  # Fixed LT2 = 4 mmol
+    lt3_la = 6.0  # Fixed LT3 = 6 mmol
 
-    for r in thresh_rows:
-        r2 = dict(r)
-        thr = to_float(r2.get("LaThreshold"))
+    # ---- HR at LT1, LT2, LT3 from La->HR interpolation ----
+    # sort by La, average duplicates
+    d = df_la_hr.groupby("La", as_index=False)["HR"].mean().sort_values("La")
+    la = d["La"].to_numpy(dtype=float)
+    hr = d["HR"].to_numpy(dtype=float)
 
-        # default blanks
-        out = {"LaB": None, "LaA": None, "PoB": None, "PoA": None, "HrB": None, "HrA": None}
+    def _hr_at_la(target):
+        if target <= la.min():
+            return float(hr[0])
+        if target >= la.max():
+            return float(hr[-1])
+        return float(np.interp(float(target), la, hr))
 
-        if thr is not None:
-            below = df[df["La"] <= thr].tail(1)
-            above = df[df["La"] >= thr].head(1)
+    hr_lt1 = _hr_at_la(lt1_la)
+    hr_lt2 = _hr_at_la(lt2_la)
+    hr_lt3 = _hr_at_la(lt3_la)
 
-            if not below.empty:
-                out["LaB"] = float(below["La"].iloc[0])
-                out["PoB"] = float(below["A_PO"].iloc[0])
-                out["HrB"] = float(below["HR"].iloc[0])
+    # Ensure ordering (from slow to fast)
+    if hr_lt1 > hr_lt2:
+        hr_lt1, hr_lt2 = hr_lt2, hr_lt1
+        lt1_la, lt2_la = lt2_la, lt1_la
+    if hr_lt2 > hr_lt3:
+        hr_lt2, hr_lt3 = hr_lt3, hr_lt2
+        lt2_la, lt3_la = lt3_la, lt2_la
 
-            if not above.empty:
-                out["LaA"] = float(above["La"].iloc[0])
-                out["PoA"] = float(above["A_PO"].iloc[0])
-                out["HrA"] = float(above["HR"].iloc[0])
+    # ---- Build 5 zones (same structure as before; adjust if you want different splits) ----
+    band = 5.0  # bpm around thresholds
+    z1_hi = max(0.0, hr_lt1 - band)
+    z2_lo, z2_hi = z1_hi, hr_lt1 + band
+    z3_lo, z3_hi = z2_hi, max(z2_hi, hr_lt2 - band)
+    z4_lo, z4_hi = z3_hi, hr_lt2 + band
+    z5_lo = z4_hi
 
-        # write outputs
-        for k, v in out.items():
-            if r2.get(k) != v:
-                r2[k] = v
-                changed = True
+    zones = [
+        _zone_row_from_bounds(df, "Z1", None, z1_hi, notes=f"LT1≈{lt1_la:.1f} mmol (HR≈{hr_lt1:.0f})"),
+        _zone_row_from_bounds(df, "Z2", z2_lo, z2_hi, notes="Endurance"),
+        _zone_row_from_bounds(df, "Z3", z3_lo, z3_hi, notes="Tempo"),
+        _zone_row_from_bounds(df, "Z4", z4_lo, z4_hi, notes=f"LT2≈{lt2_la:.1f} mmol (HR≈{hr_lt2:.0f})"),
+        _zone_row_from_bounds(df, "Z5", z5_lo, None, notes="High intensity"),
+    ]
 
-        updated.append(r2)
-
-    return updated if changed else no_update
-
-
+    return zones
 
 
+
+def create_lactate_vs_po_plot(df):
+    """
+    Create a Plotly scatter plot for Lactate vs. Power Output (PO).
+    """
+
+    # Ensure necessary columns are present
+    if not all(col in df.columns for col in ["La", "A_PO"]):
+        raise ValueError("The dataframe must contain 'La' and 'A_PO' columns.")
+
+    # Clean up the data by removing NaN values
+    df_clean = df.dropna(subset=["La", "A_PO"])
+
+    # Create a scatter plot of Lactate (La) vs Power Output (A_PO)
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=df_clean["A_PO"],  # Power Output (W)
+        y=df_clean["La"],     # Lactate (mmol/L)
+        mode='markers',       # Scatter plot (points)
+        marker=dict(color='blue', size=8, opacity=0.6),
+        name="Lactate vs Power Output"
+    ))
+
+    # Add title and labels
+    fig.update_layout(
+        title="Lactate vs Power Output (PO)",
+        xaxis_title="Power Output (W)",
+        yaxis_title="Lactate (mmol/L)",
+        template="plotly_white",  # Set a clean white theme for the plot
+        margin=dict(l=40, r=40, t=40, b=40),
+    )
+
+    return fig
+
+
+
+
+
+@dash.callback(
+    Output("form-download-zones-csv", "data"),  # Trigger the HR Zones CSV download
+    Input("form-download-zones-btn", "n_clicks"),
+    State("zones-table", "data"),  # Grab the HR zones table data
+    prevent_initial_call=True
+)
+def download_zones_csv(n_clicks, rows):
+    if not n_clicks:
+        raise PreventUpdate
+
+    # Ensure rows is a list of dictionaries (HR zones table data)
+    if not isinstance(rows, list):
+        raise ValueError("Rows data should be a list of dictionaries")
+
+    # Convert the rows (zones data) to a pandas DataFrame
+    try:
+        df = pd.DataFrame(rows)
+    except Exception as e:
+        raise ValueError(f"Error converting rows to DataFrame: {e}")
+
+    # Convert DataFrame to CSV (without index)
+    csv_data = df.to_csv(index=False)
+
+    # Return the data to be downloaded as a CSV
+    return dict(content=csv_data, filename="HR_Training_Zones.csv", type="text/csv")
