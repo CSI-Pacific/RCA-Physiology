@@ -123,7 +123,7 @@ def load_profile(n_intervals):
         )
         me_resp.raise_for_status()
         current_user = me_resp.json()
-        print(f"Current user from /me: {current_user}")
+        
         
         # Extract profile_id from current_profile, not from id
         profile_id = current_user.get('current_profile', {}).get('id')
@@ -133,7 +133,7 @@ def load_profile(n_intervals):
         
         # Fetch the full profile details
         profile = fetch_profile(token, profile_id)
-        print(f"Full profile: {profile}")
+        
         
     except Exception as e:
         print(f"Failed to fetch current user: {e}")

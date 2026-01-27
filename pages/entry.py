@@ -34,8 +34,19 @@ import tempfile
 from reportlab.lib.utils import ImageReader
 
 
+
+# add near the top with other imports
+from settings import SITE_URL, VO2_STEP_SOURCE_UUID  # TODO: define VO2_STEP_SOURCE_UUID in settings
+from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
+
+cfg = WarehouseAPIConfig(base_url=SITE_URL)
+wc = WarehouseClient(cfg, token_getter=auth.get_token)
+
+
 # Register this file as a page in the larger app
 dash.register_page(__name__, path="/entry", name="Entry")
+
+
 
 
 # ✅ Keys must match the "id" values
@@ -352,7 +363,7 @@ layout = dbc.Container(
                                 [
                                     dbc.Col(
                                         [
-                                            dbc.Label("Full Name"),
+                                            dbc.Label("Athlete"),
                                             dcc.Dropdown(
                                                 id="form-name",
                                                 options = [],
@@ -568,10 +579,15 @@ def populate_name_dropdown(selected_value):
     names = fetch_profiles(token, filters)  # Assuming this fetches profiles with full names and ids
 
     # Format the names for the dropdown
-    rv = [{'label':f"{p['person']['first_name']} {p['person']['last_name']}",'value':f"{p['person']['first_name']} {p['person']['last_name']}"} for p in names]
-
-    
+    rv = [
+        {
+            "label": f"{p['person']['first_name']} {p['person']['last_name']}",
+            "value": int(p["id"]),   # <-- profile id
+        }
+        for p in names
+    ]
     return rv
+    
 
 
 @dash.callback(
@@ -683,42 +699,97 @@ def compute_split_column(_, rows):
     Output("form-status-msg", "is_open"),
     Input("form-submit", "n_clicks"),
     Input("form-reset", "n_clicks"),
-    State("form-name", "value"),
+    State("form-name", "value"),      # will now be profile_id (int)
     State("form-mass", "value"),
-    State("form-status", "value"),
+    State("form-status", "value"),    # your Test Type (erg_C2, erg_RP3, row, etc.)
+    State("form-mode", "value"),      # Max/Submax
     State("form-notes", "value"),
     State("form-items-table", "data"),
     prevent_initial_call=True,
 )
-def submit_or_reset(submit_clicks, reset_clicks, name, mass, status, notes, table_rows):
-
+def submit_or_reset(submit_clicks, reset_clicks, profile_id, mass, test_type, mode, notes, table_rows):
     trig = ctx.triggered_id
 
     if trig == "form-reset":
         payload = {"timestamp": datetime.now().isoformat(timespec="seconds"), "reset": True}
         return payload, "Form reset requested.", True
 
+    if not submit_clicks:
+        raise PreventUpdate
+
+    # --- basic validation ---
+    if profile_id is None:
+        return no_update, "Please select an athlete before submitting.", True
+
+    table_rows = table_rows or []
+    if not isinstance(table_rows, list) or len(table_rows) == 0:
+        return no_update, "No step data found. Add at least one row.", True
+
+    # --- build a session id (lets you group steps later) ---
+    session_ts = datetime.now().isoformat(timespec="seconds")
+    session_id = f"{int(profile_id)}_{session_ts}"
+
+    # --- clean/shape records: 1 record per step row ---
+    records = []
+    for r in table_rows:
+        # skip fully empty rows (optional rule)
+        has_any = any((r.get(k) not in (None, "", []) ) for k in ["T_PO", "A_PO", "HR", "La", "V02", "rate", "rpe"])
+        if not has_any:
+            continue
+
+        records.append({
+            "profile_id": int(profile_id),
+            "session_id": session_id,
+            "session_ts": session_ts,
+            "body_mass_kg": mass,
+            "test_type": test_type,   # erg_C2, erg_RP3, row, bike...
+            "mode": mode,             # Max/Submax
+            "notes": (notes or "").strip(),
+
+            # step-level fields
+            "step_no": r.get("step_no"),
+            "step_type": r.get("Type"),
+            "target_po_w": r.get("T_PO"),
+            "actual_po_w": r.get("A_PO"),
+            "hr_bpm": r.get("HR"),
+            "lactate_mmol": r.get("La"),
+            "vo2": r.get("V02"),
+            "rate_spm": r.get("rate"),
+            "split_sec_per_500": r.get("split"),
+            "rpe": r.get("rpe"),
+        })
+
+    if not records:
+        return no_update, "All rows were empty — nothing to submit.", True
+
     payload = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "timestamp": session_ts,
         "form": {
-            "name": (name or "").strip(),
+            "profile_id": int(profile_id),
             "mass": mass,
-            "status": status,
+            "test_type": test_type,
+            "mode": mode,
             "notes": (notes or "").strip(),
         },
-        "items": table_rows or [],
+        "items": table_rows,
+        "session_id": session_id,
+        "records_preview_count": len(records),
     }
-    return payload, "Submitted successfully.", True
-'''
-@dash.callback(
-    Output("form-preview", "children"),
-    Input("form-last-payload", "data"),
-)
-def show_preview(payload):
-    if not payload:
-        return "Nothing submitted yet."
-    return json.dumps(payload, indent=2)
-'''
+
+    # --- ingest into warehouse ---
+    try:
+        dataset, created = wc.ingest_raw(
+            source_uuid=VO2_STEP_SOURCE_UUID,
+            records=records,
+            subject_field="profile_id",
+            validate_client_side=False,
+        )
+        return payload, f"Submitted {created} row(s). Dataset UUID: {dataset['uuid']}", True
+
+    except WarehouseClientError as e:
+        return payload, f"Ingest failed: {e}", True
+
+
 @dash.callback(
     Output("form-download-csv", "data"),  # This will trigger the CSV download
     Input("form-download-btn", "n_clicks"),
