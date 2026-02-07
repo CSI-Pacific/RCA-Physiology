@@ -18,5 +18,5 @@ PROFILE_ENDPOINT = f"/api/registration/profile/"
 RAW_INGEST_ENDPOINT = f"/api/warehouse/ingestion/primary/"
 
 # UUID-only: pass the DataSource UUID string directly
-VO2_STEP_SOURCE_UUID = os.environ.get("WELLNESS_SOURCE_UUID")
+VO2_STEP_SOURCE_UUID = os.environ.get("WELLNESS_SOURCE_UUID", "53dfe652-3385-458b-a621-e3324c9669d7")
 
