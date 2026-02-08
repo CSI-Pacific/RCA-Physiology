@@ -416,6 +416,19 @@ layout = dbc.Container(
                                     ),
                                     dbc.Col(
                                         [
+                                            dbc.Label("Test Date"),
+                                            dcc.DatePickerSingle(
+                                                id="form-test-date",
+                                                date=date.today().isoformat(),  # default to today
+                                                display_format="YYYY-MM-DD",
+                                                first_day_of_week=1,
+                                                clearable=False,
+                                            ),
+                                        ],
+                                        md=6,
+                                    ),
+                                    dbc.Col(
+                                        [
                                             dbc.Label("Max HR (bpm)"),
                                             dbc.Input(
                                                 id="form-max-hr",
