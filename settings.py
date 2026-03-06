@@ -3,8 +3,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SITE_URL = os.environ.get("SITE_URL","https://apps.csipacific.ca")
-#APP_URL = os.environ.get("APP_URL", "https://019c390a-d5fb-ead7-0df0-118fba4280e6.share.connect.posit.cloud/")
-APP_URL = os.environ.get("APP_URL", "http://127.0.0.1:8050/")
+APP_URL = os.environ.get("APP_URL", "https://019c390a-d5fb-ead7-0df0-118fba4280e6.share.connect.posit.cloud/")
+#APP_URL = os.environ.get("APP_URL", "http://127.0.0.1:8050/")
 AUTH_URL = f"{SITE_URL}/o/authorize"
 TOKEN_URL = f"{SITE_URL}/o/token/"
 CLIENT_ID = "bDf3z9KwxSzCFtxabQ10UwlnHCMl2IsE5teZWLu4"
