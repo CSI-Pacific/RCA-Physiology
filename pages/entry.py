@@ -1,4 +1,3 @@
-
 # pages/entry.py
 
 from datetime import datetime, date
@@ -30,6 +29,9 @@ dash.register_page(__name__, path="/entry", name="Data Entry")
 # === One-off batch upload settings (remove after use) ===
 SPORT_ORG_ID = 13  # adjust to your org ID if needed
 BATCH_UPLOAD_DRY_RUN = False  # set False to actually push data
+
+# Set to False to hide the batch-upload UI; the batch code still remains available.
+ENABLE_BATCH_UPLOAD_UI = False
 
 # Optional overrides for athlete names in the uploaded CSV.
 # Keys are values from the 'About' column; values are profile_id (preferred) or exact full name.
@@ -547,6 +549,48 @@ def _interp_y_at_x(df, x_col, y_col, x_target):
 # =========================================================
 # LAYOUT
 # =========================================================
+
+# Toggle whether the one-off batch upload UI is shown.
+# The batch upload logic remains available if you want to call it programmatically.
+BATCH_UPLOAD_UI = (
+    [
+        html.H5("One-off Batch CSV Upload", className="mt-3"),
+        dcc.Upload(
+            id="batch-upload",
+            children=html.Div(
+                [
+                    "Drag and drop a CSV file here, or click to select.",
+                ]
+            ),
+            style={
+                "width": "100%",
+                "height": "80px",
+                "lineHeight": "80px",
+                "borderWidth": "1px",
+                "borderStyle": "dashed",
+                "borderRadius": "5px",
+                "textAlign": "center",
+                "marginBottom": "8px",
+            },
+            accept=".csv",
+            multiple=False,
+        ),
+        dbc.Button(
+            "Upload CSV to Warehouse",
+            id="batch-upload-submit",
+            color="secondary",
+            className="w-100 mb-2",
+        ),
+        dbc.Alert(id="batch-upload-status", color="info", is_open=False),
+        html.Small(
+            "(Remove this batch-upload section after you’ve completed the one-off import)",
+            className="text-muted",
+        ),
+    ]
+    if ENABLE_BATCH_UPLOAD_UI
+    else []
+)
+
 layout = dbc.Container(
     [
         html.H2("Entry"),
@@ -695,39 +739,7 @@ layout = dbc.Container(
                                             ),
                                             dcc.Download(id="form-download-csv"),
 
-                                            html.Hr(),
-                                            html.H5("One-off Batch CSV Upload", className="mt-3"),
-                                            dcc.Upload(
-                                                id="batch-upload",
-                                                children=html.Div(
-                                                    [
-                                                        "Drag and drop a CSV file here, or click to select.",
-                                                    ]
-                                                ),
-                                                style={
-                                                    "width": "100%",
-                                                    "height": "80px",
-                                                    "lineHeight": "80px",
-                                                    "borderWidth": "1px",
-                                                    "borderStyle": "dashed",
-                                                    "borderRadius": "5px",
-                                                    "textAlign": "center",
-                                                    "marginBottom": "8px",
-                                                },
-                                                accept=".csv",
-                                                multiple=False,
-                                            ),
-                                            dbc.Button(
-                                                "Upload CSV to Warehouse",
-                                                id="batch-upload-submit",
-                                                color="secondary",
-                                                className="w-100 mb-2",
-                                            ),
-                                            dbc.Alert(id="batch-upload-status", color="info", is_open=False),
-                                            html.Small(
-                                                "(Remove this batch-upload section after you’ve completed the one-off import)",
-                                                className="text-muted",
-                                            ),
+                                            *BATCH_UPLOAD_UI,
                                             html.Hr(),
                                             dbc.Alert(id="form-status-msg", color="success", is_open=False),
                                         ],
@@ -1284,67 +1296,69 @@ def submit_or_reset(submit_clicks, reset_clicks, profile_id, mass, test_date, te
 # --------------------------------------------------
 # One-off batch CSV upload callback (remove after use)
 # --------------------------------------------------
-@dash.callback(
-    Output("batch-upload-status", "children"),
-    Output("batch-upload-status", "color"),
-    Output("batch-upload-status", "is_open"),
-    Input("batch-upload-submit", "n_clicks"),
-    State("batch-upload", "contents"),
-    State("batch-upload", "filename"),
-    prevent_initial_call=True,
-)
-def batch_upload(n_clicks, contents, filename):
-    if not contents:
-        return "No file uploaded.", "warning", True
+if ENABLE_BATCH_UPLOAD_UI:
 
-    if not VO2_STEP_SOURCE_UUID:
-        return (
-            "Batch upload failed: VO2_STEP_SOURCE_UUID is not set. Set it in settings.py.",
-            "danger",
-            True,
-        )
+    @dash.callback(
+        Output("batch-upload-status", "children"),
+        Output("batch-upload-status", "color"),
+        Output("batch-upload-status", "is_open"),
+        Input("batch-upload-submit", "n_clicks"),
+        State("batch-upload", "contents"),
+        State("batch-upload", "filename"),
+        prevent_initial_call=True,
+    )
+    def batch_upload(n_clicks, contents, filename):
+        if not contents:
+            return "No file uploaded.", "warning", True
 
-    try:
-        df = prepare_batch_dataframe(contents, filename)
+        if not VO2_STEP_SOURCE_UUID:
+            return (
+                "Batch upload failed: VO2_STEP_SOURCE_UUID is not set. Set it in settings.py.",
+                "danger",
+                True,
+            )
 
-        if TEST_ONLY_ATHLETE:
-            df = df[df["About"].str.strip().str.lower() == TEST_ONLY_ATHLETE.strip().lower()]
-            if df.empty:
-                return (
-                    f"No rows found for TEST_ONLY_ATHLETE='{TEST_ONLY_ATHLETE}'.", "warning", True
-                )
+        try:
+            df = prepare_batch_dataframe(contents, filename)
 
-        token = auth.get_token()
-        profiles = fetch_profiles(token, {"sport_org_id": SPORT_ORG_ID})
-        by_name = {
-            f"{p['person']['first_name']} {p['person']['last_name']}".strip().lower(): int(p['id'])
-            for p in profiles
-            if p.get('person')
-        }
+            if TEST_ONLY_ATHLETE:
+                df = df[df["About"].str.strip().str.lower() == TEST_ONLY_ATHLETE.strip().lower()]
+                if df.empty:
+                    return (
+                        f"No rows found for TEST_ONLY_ATHLETE='{TEST_ONLY_ATHLETE}'.", "warning", True
+                    )
 
-        records, skipped = build_batch_records(df, by_name)
-        if BATCH_UPLOAD_DRY_RUN:
-            msg = f"Dry run: prepared {len(records)} records (no upload)."
-            if skipped:
-                msg += f" Skipped {len(skipped)} athletes: {', '.join(skipped)}."
-            msg += " Change BATCH_UPLOAD_DRY_RUN to False to ingest."
-            return msg, "info", True
+            token = auth.get_token()
+            profiles = fetch_profiles(token, {"sport_org_id": SPORT_ORG_ID})
+            by_name = {
+                f"{p['person']['first_name']} {p['person']['last_name']}".strip().lower(): int(p['id'])
+                for p in profiles
+                if p.get('person')
+            }
 
-        dataset, created = wc.ingest_raw(
-            source_uuid=VO2_STEP_SOURCE_UUID,
-            records=records,
-            subject_field="profile_id",
-            validate_client_side=False,
-        )
+            records, skipped = build_batch_records(df, by_name)
+            if BATCH_UPLOAD_DRY_RUN:
+                msg = f"Dry run: prepared {len(records)} records (no upload)."
+                if skipped:
+                    msg += f" Skipped {len(skipped)} athletes: {', '.join(skipped)}."
+                msg += " Change BATCH_UPLOAD_DRY_RUN to False to ingest."
+                return msg, "info", True
 
-        return (
-            f"Uploaded {created} records (dataset {dataset.get('uuid')}).",
-            "success",
-            True,
-        )
+            dataset, created = wc.ingest_raw(
+                source_uuid=VO2_STEP_SOURCE_UUID,
+                records=records,
+                subject_field="profile_id",
+                validate_client_side=False,
+            )
 
-    except Exception as e:
-        return f"Batch upload failed: {e}", "danger", True
+            return (
+                f"Uploaded {created} records (dataset {dataset.get('uuid')}).",
+                "success",
+                True,
+            )
+
+        except Exception as e:
+            return f"Batch upload failed: {e}", "danger", True
 
 
 @dash.callback(
