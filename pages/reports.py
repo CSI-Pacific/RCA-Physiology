@@ -91,28 +91,19 @@ def safe_date_str(x):
 def _extract_record_payload(rec):
     """
     Try to pull the actual ingested payload out of a warehouse record.
-    Supports a few likely response shapes.
     """
     if not isinstance(rec, dict):
         return {}
 
-    # Case 1: raw fields are already top-level
+    # Raw fields already top-level
     if "profile_id" in rec or "session_id" in rec or "test_date" in rec:
         return rec
 
-    # Case 2: warehouse wraps payload under 'data'
-    if isinstance(rec.get("data"), dict):
-        return rec["data"]
+    # Common wrapped shapes
+    for key in ["data", "record", "raw"]:
+        if isinstance(rec.get(key), dict):
+            return rec[key]
 
-    # Case 3: warehouse wraps payload under 'record'
-    if isinstance(rec.get("record"), dict):
-        return rec["record"]
-
-    # Case 4: warehouse wraps payload under 'raw'
-    if isinstance(rec.get("raw"), dict):
-        return rec["raw"]
-
-    # Fallback: return original and let downstream handle it
     return rec
 
 
@@ -189,7 +180,8 @@ def apply_local_filters(df, profile_id=None, start_date=None, end_date=None, tes
         dff = dff[dff["test_date"] >= pd.to_datetime(start_date)]
 
     if end_date:
-        dff = dff[dff["test_date"] <= pd.to_datetime(end_date)]
+        # inclusive end date
+        dff = dff[dff["test_date"] < (pd.to_datetime(end_date) + pd.Timedelta(days=1))]
 
     if test_type not in (None, "", "all"):
         dff = dff[dff["test_type"] == test_type]
@@ -215,27 +207,21 @@ def fetch_step_test_data_from_warehouse(
     mode=None,
 ):
     """
-    Read records from the warehouse using WarehouseClient.list_records().
-    Note: collected_after/before filters operate on warehouse collection time,
-    not necessarily your test_date, so we still apply local filtering after load.
+    Pull records from warehouse, then filter locally by ingested test_date.
     """
     if not source_uuid:
         raise ValueError("VO2_STEP_SOURCE_UUID is not set.")
 
-    collected_after = pd.to_datetime(start_date) if start_date else None
-    collected_before = pd.to_datetime(end_date) if end_date else None
-
     records = wc.list_records(
         source_uuid=source_uuid,
         subject=int(profile_id) if profile_id not in (None, "", []) else None,
-        collected_after=collected_after,
-        collected_before=collected_before,
         role="primary",
         page_size=500,
     )
 
     df = normalize_records_to_df(records)
-    df = apply_local_filters(
+
+    return apply_local_filters(
         df,
         profile_id=profile_id,
         start_date=start_date,
@@ -243,8 +229,6 @@ def fetch_step_test_data_from_warehouse(
         test_type=test_type,
         mode=mode,
     )
-    return df
-
 def add_athlete_names(df, athlete_options):
     if df is None or df.empty:
         df = pd.DataFrame(columns=["profile_id"])
@@ -298,7 +282,7 @@ layout = dbc.Container(
                                             dbc.Label("Start Date"),
                                             dcc.DatePickerSingle(
                                                 id="reporting-start-date",
-                                                date=(date.today() - timedelta(days=180)).isoformat(),
+                                                date=(date.today() - timedelta(days=365)).isoformat(),
                                                 display_format="YYYY-MM-DD",
                                                 clearable=True,
                                             ),
@@ -310,7 +294,7 @@ layout = dbc.Container(
                                             dbc.Label("End Date"),
                                             dcc.DatePickerSingle(
                                                 id="reporting-end-date",
-                                                date=date.today().isoformat(),
+                                                date=(date.today() + timedelta(days=365)).isoformat(),
                                                 display_format="YYYY-MM-DD",
                                                 clearable=True,
                                             ),
