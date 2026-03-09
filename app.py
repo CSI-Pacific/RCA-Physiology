@@ -30,6 +30,7 @@ app = Dash(__name__,
 nav_links = [
 
     {'label':"Step Test Entry",'url':"/entry"}, 
+    {'label':"Step Test Reporting",'url':"/reports"}, 
 
 ]
 navbar = Navbar(nav_links, id="navbar", title="RCA-Physiology", expand="lg")
