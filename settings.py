@@ -9,6 +9,7 @@ AUTH_URL = f"{SITE_URL}/o/authorize"
 TOKEN_URL = f"{SITE_URL}/o/token/"
 CLIENT_ID = "bDf3z9KwxSzCFtxabQ10UwlnHCMl2IsE5teZWLu4"
 CLIENT_SECRET ="em7L8NeqjKP8vxTEYRz7LrnHKz7aU8pm7t0DfbCiyQkljgz2YEyf7j2wCfWuN3m21QfKehzAwkwBc8boXGYSOJWFm6PAif4iHQ3kbT5xZ5safDeBlt03YDgqr5EhooYR" #os.environ.get("CLIENT_SECRET")
+FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY")
 
 #
 
@@ -20,4 +21,4 @@ RAW_INGEST_ENDPOINT = f"/api/warehouse/ingestion/primary/"
 
 #VO2_STEP_SOURCE_UUID = 'a1bcb8c7-2975-4f6f-ad15-ccfb237366eb'  # OLD - doesn't exist
 VO2_STEP_SOURCE_UUID = '144f56a2-f10e-4c4b-bd8a-98afdc025f93'  # Set to None until you create/get the correct datasource UUID
-
+ERG_TEST_SOURCE_UUID = '992c95a6-86ba-47e8-8bf4-0d67dd1838e4'  # Add the warehouse datasource UUID when available
