@@ -9,6 +9,7 @@ import dash
 from dash import html, dcc, dash_table, Input, Output, State, ctx, no_update
 import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
+from dash_auth_external.exceptions import TokenExpiredError
 
 import plotly.express as px
 import plotly.graph_objects as go
@@ -16,7 +17,7 @@ import plotly.graph_objects as go
 from auth_setup import auth
 from utils import fetch_profiles
 
-from settings import SITE_URL, VO2_STEP_SOURCE_UUID
+from settings import SITE_URL, VO2_STEP_SOURCE_UUID, ERG_TEST_SOURCE_UUID
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
 import base64
 import io
@@ -32,6 +33,8 @@ BATCH_UPLOAD_DRY_RUN = False  # set False to actually push data
 
 # Set to False to hide the batch-upload UI; the batch code still remains available.
 ENABLE_BATCH_UPLOAD_UI = False
+
+AUTH_KEEPALIVE_INTERVAL_MS = 4 * 60 * 1000
 
 # Optional overrides for athlete names in the uploaded CSV.
 # Keys are values from the 'About' column; values are profile_id (preferred) or exact full name.
@@ -53,15 +56,27 @@ SKIP_ATHLETES = {
     "Lexi Shimnowski", 
     "Madelyn Vandermeer", 
     "Tess Friar", 
+    "Daniel de Groot", 
+    "Andrew Hubbard", 
+    "Claire Ellison", 
+    "Euan Coulson", 
+    "Jack (John) Walkey",
+    "Jennifer Casson", 
+    "Joshua King", 
+    "Kai Bartel",
+    "Kyle Nummi", 
+    "Leia Till",
+    "Liam Keane",
+    "Lisa Samuel",
+    "Luke Gadsdon",
+    "Michael Caryk",
+    "Mitchell Rodgers",
+    "Olivia McMurray", 
+    "Rebecca Zimmerman",
+    "William Simpson", 
+    "Emily Munroe", 
+    "Gavin Stone", 
 
-
-
-
-
-
-
-
- 
 }
 
 # If set, only upload this athlete's rows (matching 'About', case-insensitive).
@@ -132,17 +147,19 @@ TABLE_COLUMNS = [
 # ERG TEST TABLE (each row = one athlete)
 # =========================================================
 ERG_DEFAULT_ROWS = [
-    {"row_no": 1, "profile_id": "", "distance_m": None, "stroke_rate_spm": None, "power_w": None, "time_s": None},
-    {"row_no": 2, "profile_id": "", "distance_m": None, "stroke_rate_spm": None, "power_w": None, "time_s": None},
-    {"row_no": 3, "profile_id": "", "distance_m": None, "stroke_rate_spm": None, "power_w": None, "time_s": None},
+    {"row_no": 1, "profile_id": "", "test_date": date.today().isoformat(), "distance_m": None, "stroke_rate_spm": None, "power_w": None, "time_min": None, "time_s": None},
+    {"row_no": 2, "profile_id": "", "test_date": date.today().isoformat(), "distance_m": None, "stroke_rate_spm": None, "power_w": None, "time_min": None, "time_s": None},
+    {"row_no": 3, "profile_id": "", "test_date": date.today().isoformat(), "distance_m": None, "stroke_rate_spm": None, "power_w": None, "time_min": None, "time_s": None},
 ]
 
 ERG_TABLE_COLUMNS = [
     {"name": "Row", "id": "row_no", "type": "numeric"},
+    {"name": "Test Date", "id": "test_date", "type": "text"},
     {"name": "Athlete", "id": "profile_id", "type": "text", "presentation": "dropdown"},
     {"name": "Distance (m)", "id": "distance_m", "type": "numeric", "presentation": "dropdown"},
     {"name": "Stroke Rate (spm)", "id": "stroke_rate_spm", "type": "numeric"},
     {"name": "Power (W)", "id": "power_w", "type": "numeric"},
+    {"name": "Time (min)", "id": "time_min", "type": "numeric"},
     {"name": "Time (s)", "id": "time_s", "type": "numeric"},
 ]
 
@@ -184,6 +201,23 @@ def make_card(title, body):
         [dbc.CardHeader(html.B(title)), dbc.CardBody(body)],
         className="shadow-sm",
     )
+
+
+def auth_relogin_message(action="continue"):
+    return (
+        f"Your login session has expired. Re-authenticate in another tab, then return here to {action}. "
+        "The data currently entered in this page should remain in the table while this tab stays open."
+    )
+
+
+def is_auth_error(exc):
+    if isinstance(exc, TokenExpiredError):
+        return True
+    if isinstance(exc, ValueError) and "token" in str(exc).lower():
+        return True
+    if isinstance(exc, WarehouseClientError) and "token" in str(exc).lower():
+        return True
+    return False
 
 
 def to_float(x):
@@ -597,6 +631,11 @@ layout = dbc.Container(
         html.Div("Step test workflow and batch erg entry."),
         html.Hr(),
         dcc.Store(id="athlete-options-store"),
+        dcc.Interval(
+            id="auth-keepalive-interval",
+            interval=AUTH_KEEPALIVE_INTERVAL_MS,
+            n_intervals=0,
+        ),
 
         dbc.Tabs(
             [
@@ -741,6 +780,7 @@ layout = dbc.Container(
 
                                             *BATCH_UPLOAD_UI,
                                             html.Hr(),
+                                            dbc.Alert(id="form-auth-status-msg", color="warning", is_open=False),
                                             dbc.Alert(id="form-status-msg", color="success", is_open=False),
                                         ],
                                     ),
@@ -855,8 +895,45 @@ layout = dbc.Container(
                                         dbc.Button("Add row", id="erg-add-row", color="success", size="sm", className="me-2"),
                                         dbc.Button("Delete selected", id="erg-delete-rows", color="danger", size="sm", outline=True),
                                         dbc.Button("Download CSV", id="erg-download-btn", color="info", size="sm", outline=True, className="ms-2"),
+                                        dbc.Button("Push to Warehouse", id="erg-submit", color="primary", size="sm", className="ms-2"),
                                     ],
                                     className="mb-2",
+                                ),
+                                dbc.Row(
+                                    [
+                                        dbc.Col(
+                                            [
+                                                dbc.Label("Set Test Date"),
+                                                dcc.DatePickerSingle(
+                                                    id="erg-date-picker",
+                                                    date=date.today().isoformat(),
+                                                    display_format="YYYY-MM-DD",
+                                                    first_day_of_week=1,
+                                                    clearable=False,
+                                                ),
+                                            ],
+                                            md=3,
+                                        ),
+                                        dbc.Col(
+                                            dbc.Button(
+                                                "Apply Date",
+                                                id="erg-apply-date",
+                                                color="secondary",
+                                                outline=True,
+                                                className="mt-4",
+                                            ),
+                                            md=2,
+                                        ),
+                                        dbc.Col(
+                                            html.Small(
+                                                "Select rows to update only those rows, or leave none selected to update every row.",
+                                                className="text-muted",
+                                            ),
+                                            md=7,
+                                            className="d-flex align-items-end pb-2",
+                                        ),
+                                    ],
+                                    className="g-2 mb-3 erg-date-controls",
                                 ),
 
                                 html.Div(
@@ -886,7 +963,7 @@ layout = dbc.Container(
                                             "overflowX": "auto",
                                             "overflowY": "visible",
                                             "position": "relative",
-                                            "zIndex": 10,
+                                            "zIndex": 2,
                                         },
                                         style_cell={
                                             "padding": "6px 10px",
@@ -906,26 +983,56 @@ layout = dbc.Container(
                                             "backgroundColor": "white",
                                             "border": "1px solid #dee2e6",
                                         },
+                                        style_data_conditional=[
+                                            {
+                                                "if": {"column_id": "profile_id"},
+                                                "backgroundColor": "#fbfdff",
+                                            },
+                                            {
+                                                "if": {"column_id": "distance_m"},
+                                                "backgroundColor": "#fbfdff",
+                                            },
+                                        ],
                                         style_cell_conditional=[
                                             {"if": {"column_id": "row_no"}, "width": "70px"},
-                                            {"if": {"column_id": "profile_id"}, "width": "260px", "textAlign": "left"},
+                                            {"if": {"column_id": "test_date"}, "width": "130px"},
+                                            {"if": {"column_id": "profile_id"}, "width": "340px", "minWidth": "340px", "textAlign": "left"},
                                             {"if": {"column_id": "distance_m"}, "width": "140px"},
                                             {"if": {"column_id": "stroke_rate_spm"}, "width": "150px"},
                                             {"if": {"column_id": "power_w"}, "width": "130px"},
+                                            {"if": {"column_id": "time_min"}, "width": "130px"},
                                             {"if": {"column_id": "time_s"}, "width": "130px"},
                                         ],
                                         css=[
                                             {
                                                 "selector": ".dash-spreadsheet-container .Select-menu-outer",
-                                                "rule": "display: block !important; z-index: 3000 !important; max-height: 260px;",
+                                                "rule": """
+                                                    display: block !important;
+                                                    z-index: 7000 !important;
+                                                    max-height: 320px !important;
+                                                    border: 1px solid #adb5bd !important;
+                                                    border-radius: 8px !important;
+                                                    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16) !important;
+                                                    overflow-y: auto !important;
+                                                """,
                                             },
                                             {
                                                 "selector": ".dash-spreadsheet-container .Select-option",
-                                                "rule": "color: #212529 !important; background-color: white !important; padding: 8px 10px !important;",
+                                                "rule": """
+                                                    color: #212529 !important;
+                                                    background-color: white !important;
+                                                    padding: 10px 12px !important;
+                                                    line-height: 1.25 !important;
+                                                    white-space: normal !important;
+                                                """,
                                             },
                                             {
                                                 "selector": ".dash-spreadsheet-container .Select-option.is-focused",
-                                                "rule": "background-color: #f8f9fa !important;",
+                                                "rule": "background-color: #eaf3ff !important;",
+                                            },
+                                            {
+                                                "selector": ".dash-spreadsheet-container .Select-option.is-selected",
+                                                "rule": "background-color: #d7ebff !important;",
                                             },
                                             {
                                                 "selector": ".dash-spreadsheet-container .Select-value-label",
@@ -953,6 +1060,7 @@ layout = dbc.Container(
                                                     max-width: 100% !important;
                                                     min-height: 38px !important;
                                                     height: 38px !important;
+                                                    cursor: pointer !important;
                                                 """,
                                             },
                                             {
@@ -980,12 +1088,14 @@ layout = dbc.Container(
                                                 "rule": """
                                                     height: 36px !important;
                                                     margin-left: 4px !important;
+                                                    padding-left: 0 !important;
                                                 """,
                                             },
                                             {
                                                 "selector": ".dash-spreadsheet-container .Select-arrow-zone",
                                                 "rule": """
                                                     padding-right: 6px !important;
+                                                    width: 26px !important;
                                                 """,
                                             },
                                             {
@@ -995,16 +1105,25 @@ layout = dbc.Container(
                                                     box-shadow: inset 0 0 0 1px #86b7fe !important;
                                                 """,
                                             },
+                                            {
+                                                "selector": ".dash-spreadsheet-container .cell--selected",
+                                                "rule": "box-shadow: inset 0 0 0 2px #dc3545 !important;",
+                                            },
+                                            {
+                                                "selector": ".dash-spreadsheet-container td.focused",
+                                                "rule": "box-shadow: inset 0 0 0 2px #dc3545 !important;",
+                                            },
                                         ],
                                     ),
                                     style={
                                         "position": "relative",
-                                        "zIndex": 20,
+                                        "zIndex": 1,
                                         "marginBottom": "1rem",
                                     },
                                 ),
 
                                 dcc.Download(id="erg-download-csv"),
+                                dbc.Alert(id="erg-submit-status", color="success", is_open=False, className="mt-3"),
 
                                 dbc.Row(
                                     [
@@ -1051,6 +1170,23 @@ def load_athlete_options(_):
         }
         for p in names
     ]
+
+
+@dash.callback(
+    Output("form-auth-status-msg", "children"),
+    Output("form-auth-status-msg", "color"),
+    Output("form-auth-status-msg", "is_open"),
+    Input("auth-keepalive-interval", "n_intervals"),
+)
+def keep_auth_session_alive(n_intervals):
+    try:
+        auth.get_token()
+    except Exception as e:
+        if is_auth_error(e):
+            return auth_relogin_message("submit"), "warning", True
+        return "Unable to refresh the login session. Submit may fail if the session has expired.", "warning", True
+
+    return "", "success", False
 
 
 @dash.callback(
@@ -1196,6 +1332,7 @@ def compute_split_column(_, rows):
 @dash.callback(
     Output("form-last-payload", "data"),
     Output("form-status-msg", "children"),
+    Output("form-status-msg", "color"),
     Output("form-status-msg", "is_open"),
     Input("form-submit", "n_clicks"),
     Input("form-reset", "n_clicks"),
@@ -1213,20 +1350,20 @@ def submit_or_reset(submit_clicks, reset_clicks, profile_id, mass, test_date, te
 
     if trig == "form-reset":
         payload = {"timestamp": datetime.now().isoformat(timespec="seconds"), "reset": True}
-        return payload, "Form reset requested.", True
+        return payload, "Form reset requested.", "info", True
 
     if not submit_clicks:
         raise PreventUpdate
 
     if profile_id is None:
-        return no_update, "Please select an athlete before submitting.", True
+        return no_update, "Please select an athlete before submitting.", "warning", True
 
     if test_date is None:
-        return no_update, "Please select a test date before submitting.", True
+        return no_update, "Please select a test date before submitting.", "warning", True
 
     table_rows = table_rows or []
     if not isinstance(table_rows, list) or len(table_rows) == 0:
-        return no_update, "No step data found. Add at least one row.", True
+        return no_update, "No step data found. Add at least one row.", "warning", True
 
     session_ts = datetime.now().isoformat(timespec="seconds")
     session_id = f"{int(profile_id)}_{session_ts}"
@@ -1260,7 +1397,7 @@ def submit_or_reset(submit_clicks, reset_clicks, profile_id, mass, test_date, te
         })
 
     if not records:
-        return no_update, "All rows were empty — nothing to submit.", True
+        return no_update, "All rows were empty — nothing to submit.", "warning", True
 
     payload = {
         "timestamp": session_ts,
@@ -1279,7 +1416,7 @@ def submit_or_reset(submit_clicks, reset_clicks, profile_id, mass, test_date, te
 
     try:
         if not VO2_STEP_SOURCE_UUID:
-            return payload, "Ingest failed: VO2_STEP_SOURCE_UUID is not set.", True
+            return payload, "Ingest failed: VO2_STEP_SOURCE_UUID is not set.", "danger", True
 
         dataset, created = wc.ingest_raw(
             source_uuid=VO2_STEP_SOURCE_UUID,
@@ -1287,10 +1424,16 @@ def submit_or_reset(submit_clicks, reset_clicks, profile_id, mass, test_date, te
             subject_field="profile_id",
             validate_client_side=False,
         )
-        return payload, f"Submitted {created} row(s). Dataset UUID: {dataset['uuid']}", True
+        return payload, f"Submitted {created} row(s). Dataset UUID: {dataset['uuid']}", "success", True
 
     except WarehouseClientError as e:
-        return payload, f"Ingest failed: {e}", True
+        if is_auth_error(e):
+            return payload, auth_relogin_message("submit again"), "warning", True
+        return payload, f"Ingest failed: {e}", "danger", True
+    except Exception as e:
+        if is_auth_error(e):
+            return payload, auth_relogin_message("submit again"), "warning", True
+        return payload, f"Ingest failed unexpectedly: {e}", "danger", True
 
 
 # --------------------------------------------------
@@ -1634,11 +1777,13 @@ def download_zones_csv(n_clicks, rows):
     Output("erg-items-table", "selected_rows"),
     Input("erg-add-row", "n_clicks"),
     Input("erg-delete-rows", "n_clicks"),
+    Input("erg-apply-date", "n_clicks"),
     State("erg-items-table", "data"),
     State("erg-items-table", "selected_rows"),
+    State("erg-date-picker", "date"),
     prevent_initial_call=True,
 )
-def modify_erg_table(add_clicks, del_clicks, rows, selected_rows):
+def modify_erg_table(add_clicks, del_clicks, apply_date_clicks, rows, selected_rows, selected_date):
     rows = rows or []
     selected_rows = selected_rows or []
 
@@ -1647,9 +1792,11 @@ def modify_erg_table(add_clicks, del_clicks, rows, selected_rows):
         rows.append({
             "row_no": next_no,
             "profile_id": "",
+            "test_date": date.today().isoformat(),
             "distance_m": None,
             "stroke_rate_spm": None,
             "power_w": None,
+            "time_min": None,
             "time_s": None,
         })
         return rows, []
@@ -1659,6 +1806,15 @@ def modify_erg_table(add_clicks, del_clicks, rows, selected_rows):
             return no_update, no_update
         keep = [r for i, r in enumerate(rows) if i not in set(selected_rows)]
         return keep, []
+
+    if ctx.triggered_id == "erg-apply-date":
+        if not selected_date:
+            return no_update, no_update
+        indexes = set(selected_rows) if selected_rows else set(range(len(rows)))
+        for i, row in enumerate(rows):
+            if i in indexes:
+                row["test_date"] = selected_date
+        return rows, selected_rows
 
     return no_update, no_update
 
@@ -1677,13 +1833,15 @@ def update_erg_summary(rows):
     if df.empty:
         return "0", "—", "—", "—"
 
-    for c in ["power_w", "stroke_rate_spm", "time_s"]:
+    for c in ["power_w", "stroke_rate_spm", "time_min", "time_s"]:
         if c not in df.columns:
             df[c] = None
 
     p = pd.to_numeric(df["power_w"], errors="coerce")
     r = pd.to_numeric(df["stroke_rate_spm"], errors="coerce")
-    t = pd.to_numeric(df["time_s"], errors="coerce")
+    t_s = pd.to_numeric(df["time_s"], errors="coerce")
+    t_min = pd.to_numeric(df["time_min"], errors="coerce")
+    t = t_s.fillna(t_min * 60)
 
     avg_p = p.mean(skipna=True)
     avg_r = r.mean(skipna=True)
@@ -1691,7 +1849,7 @@ def update_erg_summary(rows):
 
     avg_p_txt = f"{avg_p:.1f} W" if pd.notna(avg_p) else "—"
     avg_r_txt = f"{avg_r:.1f} spm" if pd.notna(avg_r) else "—"
-    total_t_txt = f"{total_t:.0f} s" if pd.notna(total_t) else "—"
+    total_t_txt = f"{total_t / 60:.2f} min" if pd.notna(total_t) else "—"
 
     return str(len(rows)), avg_p_txt, avg_r_txt, total_t_txt
 
@@ -1709,3 +1867,89 @@ def download_erg_csv(n_clicks, rows):
         raise ValueError("Rows data should be a list of dictionaries")
     df = pd.DataFrame(rows)
     return dict(content=df.to_csv(index=False), filename="erg_batch_entry.csv", type="text/csv")
+
+
+@dash.callback(
+    Output("erg-submit-status", "children"),
+    Output("erg-submit-status", "color"),
+    Output("erg-submit-status", "is_open"),
+    Input("erg-submit", "n_clicks"),
+    State("erg-items-table", "data"),
+    prevent_initial_call=True,
+)
+def submit_erg_records(n_clicks, rows):
+    if not n_clicks:
+        raise PreventUpdate
+
+    if not ERG_TEST_SOURCE_UUID:
+        return "Push failed: ERG_TEST_SOURCE_UUID is not set in settings.py.", "danger", True
+
+    records = []
+    for row in rows or []:
+        record = {
+            "row_no": row.get("row_no"),
+            "profile_id": row.get("profile_id"),
+            "test_date": row.get("test_date"),
+            "distance_m": row.get("distance_m"),
+            "stroke_rate_spm": row.get("stroke_rate_spm"),
+            "power_w": row.get("power_w"),
+            "time_min": row.get("time_min"),
+            "time_s": row.get("time_s"),
+        }
+        required_fields = ["profile_id", "test_date", "distance_m", "stroke_rate_spm", "power_w"]
+        required_values = [record[k] for k in ["profile_id", "distance_m", "stroke_rate_spm", "power_w", "time_min", "time_s"]]
+
+        if all(value in (None, "") for value in required_values):
+            continue
+
+        missing = [
+            field
+            for field in required_fields
+            if record[field] in (None, "")
+        ]
+        if record["time_min"] in (None, "") and record["time_s"] in (None, ""):
+            missing.append("time_min or time_s")
+        if missing:
+            return f"Push failed: row {record['row_no']} is missing {', '.join(missing)}.", "danger", True
+
+        try:
+            datetime.strptime(str(record["test_date"]), "%Y-%m-%d")
+            record["row_no"] = int(record["row_no"])
+            record["profile_id"] = int(record["profile_id"])
+            record["distance_m"] = int(record["distance_m"])
+            record["stroke_rate_spm"] = float(record["stroke_rate_spm"])
+            record["power_w"] = float(record["power_w"])
+            if record["time_min"] in (None, ""):
+                record["time_s"] = float(record["time_s"])
+                record["time_min"] = round(record["time_s"] / 60, 4)
+            elif record["time_s"] in (None, ""):
+                record["time_min"] = float(record["time_min"])
+                record["time_s"] = round(record["time_min"] * 60, 2)
+            else:
+                record["time_min"] = float(record["time_min"])
+                record["time_s"] = float(record["time_s"])
+        except (TypeError, ValueError):
+            return f"Push failed: row {record['row_no']} contains an invalid value. Use YYYY-MM-DD for test_date and enter time as minutes or seconds.", "danger", True
+
+        records.append(record)
+
+    if not records:
+        return "Push failed: enter at least one complete erg result.", "danger", True
+
+    try:
+        dataset, created = wc.ingest_raw(
+            source_uuid=ERG_TEST_SOURCE_UUID,
+            records=records,
+            subject_field="profile_id",
+            validate_client_side=False,
+        )
+        return f"Submitted {created} erg row(s). Dataset UUID: {dataset['uuid']}", "success", True
+    except WarehouseClientError as e:
+        if is_auth_error(e):
+            return auth_relogin_message("submit again"), "warning", True
+        return f"Push failed: {e}", "danger", True
+    except Exception as e:
+        if is_auth_error(e):
+            return auth_relogin_message("submit again"), "warning", True
+        return f"Push failed unexpectedly: {e}", "danger", True
+
