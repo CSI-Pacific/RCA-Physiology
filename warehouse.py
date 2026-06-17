@@ -13,6 +13,21 @@ class WarehouseClientError(Exception):
     """Raised for configuration, network, and server-errors from the Warehouse client."""
 
 
+def _format_error_detail(resp: requests.Response) -> str:
+    content_type = resp.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            err = resp.json()
+            return str(err.get("detail") or err)
+        except ValueError:
+            pass
+
+    text = (resp.text or "").strip()
+    if resp.status_code >= 500:
+        return f"HTTP {resp.status_code} server error"
+    return text or f"HTTP {resp.status_code}"
+
+
 @dataclass
 class WarehouseAPIConfig:
     """
@@ -34,6 +49,9 @@ class WarehouseAPIConfig:
     @property
     def records_url(self) -> str:
         return self.base_url.rstrip("/") + self.records_list_path
+
+    def record_url(self, record_uuid: str) -> str:
+        return self.base_url.rstrip("/") + self.records_list_path.rstrip("/") + f"/{record_uuid}/"
 
 class WarehouseClient:
     """
@@ -223,6 +241,151 @@ class WarehouseClient:
             results.append(rec)
         return results
 
+    def patch_record(
+            self,
+            *,
+            record_uuid: str,
+            data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Partially update a DataRecord by UUID.
+
+        `data` is the DataRecord serializer payload, e.g. {"data": {...}}.
+        """
+        if not record_uuid:
+            raise WarehouseClientError("No record UUID provided.")
+
+        headers = {
+            "Authorization": self._bearer(),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        try:
+            resp = requests.patch(
+                self.config.record_url(record_uuid),
+                headers=headers,
+                data=json.dumps(self._json_safe(data), allow_nan=False),
+                timeout=self.config.timeout_s,
+            )
+        except requests.RequestException as e:
+            raise WarehouseClientError(f"Network error patching record {record_uuid}: {e}") from e
+
+        if resp.ok:
+            try:
+                return resp.json()
+            except ValueError as e:
+                raise WarehouseClientError("Patch response was not valid JSON.") from e
+
+        detail = _format_error_detail(resp)
+        raise WarehouseClientError(f"Patch record {record_uuid} failed: {detail}")
+
+    def put_record(
+            self,
+            *,
+            record_uuid: str,
+            data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Fully update a DataRecord by UUID.
+
+        This is useful as a fallback for API deployments where partial update is
+        exposed in the schema but fails server-side.
+        """
+        if not record_uuid:
+            raise WarehouseClientError("No record UUID provided.")
+
+        headers = {
+            "Authorization": self._bearer(),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        try:
+            resp = requests.put(
+                self.config.record_url(record_uuid),
+                headers=headers,
+                data=json.dumps(self._json_safe(data), allow_nan=False),
+                timeout=self.config.timeout_s,
+            )
+        except requests.RequestException as e:
+            raise WarehouseClientError(f"Network error putting record {record_uuid}: {e}") from e
+
+        if resp.ok:
+            try:
+                return resp.json()
+            except ValueError as e:
+                raise WarehouseClientError("Put response was not valid JSON.") from e
+
+        detail = _format_error_detail(resp)
+        raise WarehouseClientError(f"Put record {record_uuid} failed: {detail}")
+
+    def create_record(
+            self,
+            *,
+            data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Create a DataRecord directly in an existing dataset.
+
+        Expected payload shape: {"dataset": "<dataset_uuid>", "data": {...}}.
+        """
+        headers = {
+            "Authorization": self._bearer(),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        try:
+            resp = requests.post(
+                self.config.records_url,
+                headers=headers,
+                data=json.dumps(self._json_safe(data), allow_nan=False),
+                timeout=self.config.timeout_s,
+            )
+        except requests.RequestException as e:
+            raise WarehouseClientError(f"Network error creating replacement record: {e}") from e
+
+        if resp.status_code == 201:
+            try:
+                return resp.json()
+            except ValueError as e:
+                raise WarehouseClientError("Create response was not valid JSON.") from e
+
+        detail = _format_error_detail(resp)
+        raise WarehouseClientError(f"Create replacement record failed: {detail}")
+
+    def delete_record(
+            self,
+            *,
+            record_uuid: str,
+    ) -> None:
+        """
+        Delete a DataRecord by UUID.
+        """
+        if not record_uuid:
+            raise WarehouseClientError("No record UUID provided.")
+
+        headers = {
+            "Authorization": self._bearer(),
+            "Accept": "application/json",
+        }
+
+        try:
+            resp = requests.delete(
+                self.config.record_url(record_uuid),
+                headers=headers,
+                timeout=self.config.timeout_s,
+            )
+        except requests.RequestException as e:
+            raise WarehouseClientError(f"Network error deleting record {record_uuid}: {e}") from e
+
+        if resp.status_code == 204:
+            return
+
+        detail = _format_error_detail(resp)
+        raise WarehouseClientError(f"Delete old record {record_uuid} failed: {detail}")
+
     def iter_records(
             self,
             *,
@@ -325,3 +488,22 @@ class WarehouseClient:
                 return dt.isoformat() + "Z"
             return dt.isoformat()
         raise TypeError("collected_after/collected_before must be str, date, or datetime")
+
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, float) and value != value:
+            return None
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {k: WarehouseClient._json_safe(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [WarehouseClient._json_safe(v) for v in value]
+        if hasattr(value, "item"):
+            try:
+                return WarehouseClient._json_safe(value.item())
+            except Exception:
+                return value
+        return value
