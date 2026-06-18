@@ -29,13 +29,14 @@ dash.register_page(__name__, path="/reports", name="Reporting")
 # =========================================================
 REPORT_TABLE_COLUMNS = [
     {"name": "Record UUID", "id": "__record_uuid", "editable": False},
+    {"name": "Row Issues", "id": "__row_issues", "editable": False},
     {"name": "Test Date", "id": "test_date", "editable": False},
+    {"name": "Athlete", "id": "athlete_name", "editable": False},
     {"name": "Athlete ID", "id": "profile_id", "editable": False},
     {"name": "Session ID", "id": "session_id", "editable": False},
     {"name": "Step", "id": "step_no", "editable": False},
-    {"name": "Step Type", "id": "step_type", "editable": True},
-    {"name": "Mode", "id": "mode", "editable": True},
-    {"name": "Test Type", "id": "test_type", "editable": True},
+    {"name": "Mode", "id": "mode", "editable": True, "presentation": "dropdown"},
+    {"name": "Test Type", "id": "test_type", "editable": True, "presentation": "dropdown"},
     {"name": "Target PO", "id": "target_po_w", "editable": True},
     {"name": "Actual PO", "id": "actual_po_w", "editable": True},
     {"name": "HR", "id": "hr_bpm", "editable": True},
@@ -48,6 +49,23 @@ REPORT_TABLE_COLUMNS = [
     {"name": "Body Mass", "id": "body_mass_kg", "editable": True},
     {"name": "Notes", "id": "notes", "editable": True},
 ]
+
+REPORT_DROPDOWN_OPTIONS = {
+    "mode": [
+        {"label": "Max", "value": "Max"},
+        {"label": "Submax", "value": "Submax"},
+        {"label": "Sub Max", "value": "Sub Max"},
+        {"label": "max", "value": "max"},
+        {"label": "submax", "value": "submax"},
+    ],
+    "test_type": [
+        {"label": "Erg C2", "value": "erg_C2"},
+        {"label": "Erg RP3", "value": "erg_RP3"},
+        {"label": "On-Water", "value": "row"},
+        {"label": "Bike", "value": "bike"},
+        {"label": "Other", "value": "other"},
+    ],
+}
 
 REPORT_EDITABLE_COLUMNS = {
     col["id"]
@@ -99,6 +117,34 @@ REPORT_DATA_COLUMNS = [
     "split_sec_per_500",
     "rpe",
     "time_s",
+]
+
+REPORT_NON_PAYLOAD_COLUMNS = {"athlete_name", "__row_issues"}
+
+ZONES_DEFAULT_ROWS = [
+    {"Zone": "Z1", "HR_low": None, "HR_high": None, "PO_low": None, "PO_high": None,
+     "Split_low": None, "Split_high": None, "Rate_low": None, "Rate_high": None, "Notes": ""},
+    {"Zone": "Z2", "HR_low": None, "HR_high": None, "PO_low": None, "PO_high": None,
+     "Split_low": None, "Split_high": None, "Rate_low": None, "Rate_high": None, "Notes": ""},
+    {"Zone": "Z3", "HR_low": None, "HR_high": None, "PO_low": None, "PO_high": None,
+     "Split_low": None, "Split_high": None, "Rate_low": None, "Rate_high": None, "Notes": ""},
+    {"Zone": "Z4", "HR_low": None, "HR_high": None, "PO_low": None, "PO_high": None,
+     "Split_low": None, "Split_high": None, "Rate_low": None, "Rate_high": None, "Notes": ""},
+    {"Zone": "Z5", "HR_low": None, "HR_high": None, "PO_low": None, "PO_high": None,
+     "Split_low": None, "Split_high": None, "Rate_low": None, "Rate_high": None, "Notes": ""},
+]
+
+ZONES_COLUMNS = [
+    {"name": "Zone", "id": "Zone", "type": "text"},
+    {"name": "HR Low", "id": "HR_low", "type": "numeric"},
+    {"name": "HR High", "id": "HR_high", "type": "numeric"},
+    {"name": "PO Low (W)", "id": "PO_low", "type": "numeric"},
+    {"name": "PO High (W)", "id": "PO_high", "type": "numeric"},
+    {"name": "Split Low (s/500)", "id": "Split_low", "type": "text"},
+    {"name": "Split High (s/500)", "id": "Split_high", "type": "text"},
+    {"name": "Rate Low (spm)", "id": "Rate_low", "type": "numeric"},
+    {"name": "Rate High (spm)", "id": "Rate_high", "type": "numeric"},
+    {"name": "Notes", "id": "Notes", "type": "text"},
 ]
 
 
@@ -282,6 +328,37 @@ def safe_date_str(x):
         return None
 
 
+def estimate_split_seconds(power_w):
+    p = to_float(power_w)
+    if p is None or p <= 0:
+        return None
+    pace = 500.0 * ((2.8 / p) ** (1.0 / 3.0))
+    return round(pace, 2)
+
+
+def _interp_y_at_x(df, x_col, y_col, x_target):
+    if df is None or df.empty or x_target is None:
+        return None
+
+    d = df.copy()
+    d[x_col] = pd.to_numeric(d.get(x_col), errors="coerce")
+    d[y_col] = pd.to_numeric(d.get(y_col), errors="coerce")
+    d = d.dropna(subset=[x_col, y_col])
+    if len(d) < 2:
+        return None
+
+    d = d.groupby(x_col, as_index=False)[y_col].mean().sort_values(x_col)
+    x = d[x_col].to_numpy(dtype=float)
+    y = d[y_col].to_numpy(dtype=float)
+
+    if x_target <= x.min():
+        return float(y[0])
+    if x_target >= x.max():
+        return float(y[-1])
+
+    return float(np.interp(float(x_target), x, y))
+
+
 def clean_cell_value(value, column_id):
     if column_id in REPORT_STRING_DEFAULTS and (value is None or value == "" or pd.isna(value)):
         return REPORT_STRING_DEFAULTS[column_id]
@@ -328,6 +405,381 @@ def values_equal(a, b, column_id):
             return a_clean == b_clean
 
     return a_clean == b_clean
+
+
+def display_value(value, column_id=None):
+    if value is None:
+        return "—"
+    try:
+        if pd.isna(value):
+            return "—"
+    except Exception:
+        pass
+    if column_id == "split_sec_per_500":
+        return format_split_mmss(value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def row_label(row):
+    athlete = row.get("athlete_name") or row.get("profile_id") or "Athlete"
+    test_date = display_value(row.get("test_date"))
+    session = row.get("session_id") or "No session"
+    step = display_value(row.get("step_no"))
+    return f"{athlete} | {test_date} | {session} | Step {step}"
+
+
+def get_changed_cells(original_records, edited_rows):
+    original_df = normalize_records_to_df(original_records)
+    edited_df = pd.DataFrame(edited_rows or [])
+
+    if original_df.empty or edited_df.empty or "__record_uuid" not in edited_df.columns:
+        return []
+
+    original_by_uuid = {
+        str(row["__record_uuid"]): row
+        for row in original_df.to_dict("records")
+        if row.get("__record_uuid")
+    }
+
+    changes = []
+    for edited_row in edited_df.to_dict("records"):
+        record_uuid = edited_row.get("__record_uuid")
+        if not record_uuid:
+            continue
+
+        original_row = original_by_uuid.get(str(record_uuid))
+        if not original_row:
+            continue
+
+        for col in REPORT_EDITABLE_COLUMNS:
+            if not values_equal(edited_row.get(col), original_row.get(col), col):
+                changes.append(
+                    {
+                        "record_uuid": str(record_uuid),
+                        "column_id": col,
+                        "column_name": next(
+                            (c["name"] for c in REPORT_TABLE_COLUMNS if c["id"] == col),
+                            col,
+                        ),
+                        "old": clean_cell_value(original_row.get(col), col),
+                        "new": clean_cell_value(edited_row.get(col), col),
+                        "row_label": row_label(edited_row),
+                    }
+                )
+
+    return changes
+
+
+def validate_reporting_rows(edited_rows):
+    issues = []
+    for idx, row in enumerate(edited_rows or []):
+        label = row_label(row)
+        record_uuid = row.get("__record_uuid")
+
+        def add_issue(column_id, message):
+            issues.append(
+                {
+                    "row_index": idx,
+                    "record_uuid": str(record_uuid) if record_uuid else "",
+                    "column_id": column_id,
+                    "row_label": label,
+                    "message": message,
+                }
+            )
+
+        numeric_ranges = {
+            "actual_po_w": (0, 1200, "Actual PO should be between 0 and 1200 W."),
+            "target_po_w": (0, 1200, "Target PO should be between 0 and 1200 W."),
+            "hr_bpm": (30, 240, "HR should be between 30 and 240 bpm."),
+            "lactate_mmol": (0, 30, "Lactate should be between 0 and 30 mmol/L."),
+            "vo2": (0, 100, "VO2 should be between 0 and 100."),
+            "rate_spm": (0, 80, "Rate should be between 0 and 80 spm."),
+            "rpe": (0, 20, "RPE should be between 0 and 20."),
+            "time_s": (0, 7200, "Time should be between 0 and 7200 seconds."),
+            "body_mass_kg": (20, 250, "Body mass should be between 20 and 250 kg."),
+        }
+
+        for col, (low, high, message) in numeric_ranges.items():
+            raw_value = row.get(col)
+            if raw_value in (None, ""):
+                continue
+            value = to_float(raw_value)
+            if value is None:
+                add_issue(col, f"{col} must be numeric.")
+            elif value < low or value > high:
+                add_issue(col, message)
+
+        for col, options in REPORT_DROPDOWN_OPTIONS.items():
+            value = row.get(col)
+            valid_values = {opt["value"] for opt in options}
+            if value not in (None, "") and value not in valid_values:
+                add_issue(col, f"{col} should use one of the known options.")
+
+    return issues
+
+
+def build_change_summary(changes, issues):
+    if issues:
+        issue_rows = [
+            html.Li(f"{issue['row_label']} - {issue['message']}")
+            for issue in issues[:12]
+        ]
+        if len(issues) > 12:
+            issue_rows.append(html.Li(f"...and {len(issues) - 12} more issue(s)."))
+        return html.Div(
+            [
+                html.P("Resolve these issues before updating the warehouse."),
+                html.Ul(issue_rows, className="mb-0"),
+            ]
+        )
+
+    if not changes:
+        return html.Div("No editable changes detected.")
+
+    grouped = {}
+    for change in changes:
+        grouped.setdefault(change["row_label"], []).append(change)
+
+    blocks = []
+    for label, row_changes in list(grouped.items())[:8]:
+        blocks.append(html.H6(label, className="mt-2 mb-1"))
+        blocks.append(
+            dbc.Table(
+                [
+                    html.Tbody(
+                        [
+                            html.Tr(
+                                [
+                                    html.Td(change["column_name"]),
+                                    html.Td(display_value(change["old"], change["column_id"])),
+                                    html.Td(display_value(change["new"], change["column_id"])),
+                                ]
+                            )
+                            for change in row_changes
+                        ]
+                    )
+                ],
+                bordered=True,
+                size="sm",
+                className="mb-2",
+            )
+        )
+
+    if len(grouped) > 8:
+        blocks.append(html.Div(f"...and {len(grouped) - 8} more changed row(s)."))
+
+    return html.Div(
+        [
+            html.P(f"Ready to update {len(grouped)} row(s), {len(changes)} field change(s)."),
+            dbc.Table(
+                html.Thead(html.Tr([html.Th("Field"), html.Th("Current"), html.Th("New")])),
+                bordered=True,
+                size="sm",
+                className="mb-1",
+            ),
+            *blocks,
+        ]
+    )
+
+
+def build_reporting_table_styles(changes, issues):
+    styles = [
+        {
+            "if": {"column_id": col},
+            "backgroundColor": "#f3f9ff",
+        }
+        for col in REPORT_EDITABLE_COLUMNS
+    ]
+
+    for change in changes:
+        styles.append(
+            {
+                "if": {
+                    "filter_query": f'{{__record_uuid}} = "{change["record_uuid"]}"',
+                    "column_id": change["column_id"],
+                },
+                "backgroundColor": "#fff3cd",
+                "border": "1px solid #d39e00",
+            }
+        )
+
+    for issue in issues:
+        if not issue.get("record_uuid"):
+            continue
+        styles.append(
+            {
+                "if": {
+                    "filter_query": f'{{__record_uuid}} = "{issue["record_uuid"]}"',
+                    "column_id": issue["column_id"],
+                },
+                "backgroundColor": "#f8d7da",
+                "border": "1px solid #dc3545",
+            }
+        )
+
+    return styles
+
+
+def build_reporting_table_columns(edit_mode=False):
+    columns = []
+    for col in REPORT_TABLE_COLUMNS:
+        next_col = col.copy()
+        if next_col["id"] in REPORT_EDITABLE_COLUMNS:
+            next_col["editable"] = bool(edit_mode)
+        columns.append(next_col)
+    return columns
+
+
+def compute_report_zones_from_df(df, max_hr_input=None):
+    if df is None or df.empty:
+        return ZONES_DEFAULT_ROWS
+
+    zones_df = df.copy()
+    for c in ["hr_bpm", "lactate_mmol", "actual_po_w", "rate_spm"]:
+        if c not in zones_df.columns:
+            zones_df[c] = None
+
+    zones_df["hr_bpm"] = pd.to_numeric(zones_df["hr_bpm"], errors="coerce")
+    zones_df["lactate_mmol"] = pd.to_numeric(zones_df["lactate_mmol"], errors="coerce")
+    zones_df["actual_po_w"] = pd.to_numeric(zones_df["actual_po_w"], errors="coerce")
+    zones_df["rate_spm"] = pd.to_numeric(zones_df["rate_spm"], errors="coerce")
+
+    df_la_hr = zones_df.dropna(subset=["lactate_mmol", "hr_bpm"]).copy()
+    if len(df_la_hr) < 2:
+        return ZONES_DEFAULT_ROWS
+
+    if max_hr_input is not None and max_hr_input != "":
+        hr_max = float(max_hr_input)
+    else:
+        hr_max = zones_df["hr_bpm"].max()
+        if pd.isna(hr_max):
+            hr_max = df_la_hr["hr_bpm"].max()
+
+    hr_max = float(hr_max)
+
+    d_la_hr = df_la_hr.groupby("lactate_mmol", as_index=False)["hr_bpm"].mean().sort_values("lactate_mmol")
+    la_vals = d_la_hr["lactate_mmol"].to_numpy(dtype=float)
+    hr_vals = d_la_hr["hr_bpm"].to_numpy(dtype=float)
+
+    def hr_at_la(target_la):
+        if target_la <= la_vals.min():
+            return float(hr_vals[0])
+        if target_la >= la_vals.max():
+            return float(hr_vals[-1])
+        return float(np.interp(float(target_la), la_vals, hr_vals))
+
+    df_la_po = zones_df.dropna(subset=["lactate_mmol", "actual_po_w"]).copy()
+    po_at_la_ok = len(df_la_po) >= 2
+    if po_at_la_ok:
+        d_la_po = df_la_po.groupby("lactate_mmol", as_index=False)["actual_po_w"].mean().sort_values("lactate_mmol")
+        la_po_vals = d_la_po["lactate_mmol"].to_numpy(dtype=float)
+        po_vals = d_la_po["actual_po_w"].to_numpy(dtype=float)
+
+        def po_at_la(target_la):
+            if target_la <= la_po_vals.min():
+                return float(po_vals[0])
+            if target_la >= la_po_vals.max():
+                return float(po_vals[-1])
+            return float(np.interp(float(target_la), la_po_vals, po_vals))
+    else:
+        po_at_la = None  # noqa
+
+    def hr_at_po(target_po):
+        return _interp_y_at_x(zones_df, "actual_po_w", "hr_bpm", target_po)
+
+    def po_at_hr(target_hr):
+        return _interp_y_at_x(zones_df, "hr_bpm", "actual_po_w", target_hr)
+
+    def rate_at_hr(target_hr):
+        return _interp_y_at_x(zones_df, "hr_bpm", "rate_spm", target_hr)
+
+    def split_from_po(target_po):
+        if target_po is None:
+            return None
+        return format_split_mmss(estimate_split_seconds(target_po))
+
+    def zone_row(zone_code, label, hr_low, hr_high, po_low, po_high, notes=""):
+        rate_low = rate_at_hr(hr_low) if hr_low is not None else None
+        rate_high = rate_at_hr(hr_high) if hr_high is not None else None
+
+        return {
+            "Zone": f"{zone_code}/{label}",
+            "HR_low": round(hr_low, 0) if hr_low is not None else None,
+            "HR_high": round(hr_high, 0) if hr_high is not None else None,
+            "PO_low": round(po_low, 1) if po_low is not None else None,
+            "PO_high": round(po_high, 1) if po_high is not None else None,
+            "Split_low": split_from_po(po_low),
+            "Split_high": split_from_po(po_high),
+            "Rate_low": round(rate_low, 1) if rate_low is not None else None,
+            "Rate_high": round(rate_high, 1) if rate_high is not None else None,
+            "Notes": notes or "",
+        }
+
+    LA_LOW_C6 = 1.5
+    LA_2 = 2.0
+    LA_4 = 4.0
+
+    hr_15 = hr_at_la(LA_LOW_C6)
+    hr_2 = hr_at_la(LA_2)
+    hr_4 = hr_at_la(LA_4)
+
+    hr_15, hr_2, hr_4 = sorted([hr_15, hr_2, hr_4])
+
+    z1_lo = 100.0
+    z1_hi = hr_15
+    z2_lo = hr_15
+    z2_hi = hr_2
+
+    if not po_at_la_ok:
+        return [
+            zone_row("Z1", "C7", z1_lo, z1_hi, po_at_hr(z1_lo), po_at_hr(z1_hi), notes="HR-based"),
+            zone_row("Z2", "C6", z2_lo, z2_hi, po_at_hr(z2_lo), po_at_hr(z2_hi), notes="HR-based"),
+            zone_row("Z3", "C5", z2_hi, hr_4, po_at_hr(z2_hi), po_at_hr(hr_4), notes="Fallback (no La→PO)"),
+            zone_row("Z4", "C4", None, None, None, None, notes="Fallback (no La→PO)"),
+            zone_row("Z5", "C3", hr_4, (hr_4 + hr_max) / 2.0, po_at_hr(hr_4), None, notes="HR-based"),
+            zone_row("Z6", "C2/C1", (hr_4 + hr_max) / 2.0, hr_max, None, None, notes="HR-based"),
+        ]
+
+    po_2 = float(po_at_la(LA_2))
+    po_4 = float(po_at_la(LA_4))
+    po_lo, po_hi = (po_2, po_4) if po_2 <= po_4 else (po_4, po_2)
+    po_mid = (po_lo + po_hi) / 2.0
+
+    hr_at_po2 = hr_at_po(po_lo)
+    hr_at_pomid = hr_at_po(po_mid)
+    hr_at_po4 = hr_at_po(po_hi)
+
+    if hr_at_po2 is None:
+        hr_at_po2 = hr_2
+    if hr_at_pomid is None:
+        hr_at_pomid = (hr_2 + hr_4) / 2.0
+    if hr_at_po4 is None:
+        hr_at_po4 = hr_4
+
+    z3_po_lo, z3_po_hi = po_lo, po_mid
+    z3_hr_lo, z3_hr_hi = float(hr_at_po2), float(hr_at_pomid)
+
+    z4_po_lo, z4_po_hi = po_mid, po_hi
+    z4_hr_lo, z4_hr_hi = float(hr_at_pomid), float(hr_at_po4)
+
+    z5_hr_lo = hr_4
+    z5_hr_hi = (hr_4 + hr_max) / 2.0
+    z6_hr_lo = z5_hr_hi
+    z6_hr_hi = hr_max
+
+    z5_po_low = po_at_hr(z5_hr_lo)
+    z6_po_low = po_at_hr(z6_hr_lo)
+
+    return [
+        zone_row("Z1", "C7", z1_lo, z1_hi, po_at_hr(z1_lo), po_at_hr(z1_hi), notes="100 bpm -> low C6 (HR@1.5)"),
+        zone_row("Z2", "C6", z2_lo, z2_hi, po_at_hr(z2_lo), po_at_hr(z2_hi), notes="1.5-2 mmol HR"),
+        zone_row("Z3", "C5", z3_hr_lo, z3_hr_hi, z3_po_lo, z3_po_hi, notes="2 mmol W -> midpoint (2-4 mmol W)"),
+        zone_row("Z4", "C4", z4_hr_lo, z4_hr_hi, z4_po_lo, z4_po_hi, notes="Midpoint -> 4 mmol W"),
+        zone_row("Z5", "C3", z5_hr_lo, z5_hr_hi, z5_po_low, None, notes="4 mmol HR -> halfway to max HR"),
+        zone_row("Z6", "C2/C1", z6_hr_lo, z6_hr_hi, z6_po_low, None, notes="Halfway -> max HR"),
+    ]
 
 
 def dataframe_to_store_records(df):
@@ -520,6 +972,7 @@ layout = dbc.Container(
 
         dcc.Store(id="reporting-athlete-options-store"),
         dcc.Store(id="reporting-data-store"),
+        dcc.Store(id="reporting-edit-mode-store", data=False),
 
         dbc.Row(
             [
@@ -609,6 +1062,17 @@ layout = dbc.Container(
                                 className="g-2",
                             ),
                             html.Br(),
+                            dbc.Label("Max HR (bpm)"),
+                            dbc.Input(
+                                id="reporting-max-hr",
+                                type="number",
+                                min=100,
+                                max=240,
+                                step=1,
+                                placeholder="optional",
+                                value=None,
+                            ),
+                            html.Br(),
 
                             dbc.Row(
                                 [
@@ -636,11 +1100,31 @@ layout = dbc.Container(
                             ),
                             html.Br(),
                             dbc.Button(
-                                "Update Warehouse",
-                                id="reporting-update-btn",
-                                color="success",
+                                "Edit Data",
+                                id="reporting-edit-btn",
+                                color="secondary",
                                 outline=True,
                                 className="w-100",
+                            ),
+                            html.Div(
+                                [
+                                    dbc.Button(
+                                        "Revert Changes",
+                                        id="reporting-revert-btn",
+                                        color="secondary",
+                                        outline=True,
+                                        className="w-100",
+                                        disabled=True,
+                                    ),
+                                    dbc.Button(
+                                        "Review Changes",
+                                        id="reporting-update-btn",
+                                        color="success",
+                                        className="w-100 mt-2",
+                                        disabled=True,
+                                    ),
+                                ],
+                                className="mt-2",
                             ),
                             dcc.Download(id="reporting-download"),
                             html.Hr(),
@@ -668,13 +1152,17 @@ layout = dbc.Container(
                             dash_table.DataTable(
                                 id="reporting-table",
                                 data=[],
-                                columns=REPORT_TABLE_COLUMNS,
-                                hidden_columns=["__record_uuid"],
+                                columns=build_reporting_table_columns(False),
+                                hidden_columns=["__record_uuid", "profile_id", "__row_issues"],
                                 editable=True,
                                 page_action="native",
                                 page_size=15,
                                 sort_action="native",
                                 filter_action="native",
+                                dropdown={
+                                    col: {"options": options}
+                                    for col, options in REPORT_DROPDOWN_OPTIONS.items()
+                                },
                                 style_table={"overflowX": "auto"},
                                 style_cell={
                                     "padding": "8px",
@@ -703,6 +1191,28 @@ layout = dbc.Container(
                                 ],
                             ),
                         ),
+                        html.Br(),
+                        make_card(
+                            "HR Training Zones (from Lactate Thresholds)",
+                            dash_table.DataTable(
+                                id="reporting-zones-table",
+                                data=ZONES_DEFAULT_ROWS,
+                                columns=ZONES_COLUMNS,
+                                editable=False,
+                                page_action="none",
+                                style_table={"overflowX": "auto"},
+                                style_cell={
+                                    "padding": "8px",
+                                    "fontFamily": "system-ui",
+                                    "fontSize": 14,
+                                    "textAlign": "left",
+                                    "minWidth": "90px",
+                                    "maxWidth": "220px",
+                                    "whiteSpace": "normal",
+                                },
+                                style_header={"fontWeight": "600"},
+                            ),
+                        ),
                     ],
                     md=9,
                 ),
@@ -724,6 +1234,28 @@ layout = dbc.Container(
                 dbc.Col(dcc.Graph(id="reporting-session-trend-plot", config={"displayModeBar": False}), md=12),
             ],
             className="g-2 mt-2",
+        ),
+
+        dbc.Modal(
+            [
+                dbc.ModalHeader(dbc.ModalTitle("Review Warehouse Changes")),
+                dbc.ModalBody(id="reporting-change-summary"),
+                dbc.ModalFooter(
+                    [
+                        dbc.Button("Cancel", id="reporting-cancel-update-btn", color="secondary", outline=True),
+                        dbc.Button(
+                            "Update Warehouse",
+                            id="reporting-confirm-update-btn",
+                            color="success",
+                            disabled=True,
+                        ),
+                    ]
+                ),
+            ],
+            id="reporting-review-modal",
+            size="lg",
+            is_open=False,
+            scrollable=True,
         ),
     ],
     fluid=True,
@@ -815,16 +1347,19 @@ def load_reporting_data(n_clicks, athlete_id, start_date, end_date, test_type, m
     Output("reporting-avg-po", "children"),
     Output("reporting-avg-hr", "children"),
     Input("reporting-data-store", "data"),
+    State("reporting-athlete-options-store", "data"),
 )
-def update_reporting_table(records):
+def update_reporting_table(records, athlete_options):
     df = normalize_records_to_df(records)
 
     if df.empty:
         return [], "0", "0", "—", "—"
 
     df_display = df.copy()
+    df_display = add_athlete_names(df_display, athlete_options)
     df_display["test_date"] = df_display["test_date"].astype(str)
     df_display["split_sec_per_500"] = df_display["split_sec_per_500"].apply(format_split_mmss)
+    df_display["__row_issues"] = ""
 
     rows_txt = str(len(df_display))
     sessions_txt = str(df_display["session_id"].dropna().nunique())
@@ -839,11 +1374,104 @@ def update_reporting_table(records):
 
 
 @dash.callback(
+    Output("reporting-zones-table", "data"),
+    Input("reporting-table", "data"),
+    Input("reporting-max-hr", "value"),
+)
+def update_reporting_zones(table_rows, max_hr_input):
+    df = normalize_records_to_df(table_rows)
+    return compute_report_zones_from_df(df, max_hr_input)
+
+
+@dash.callback(
+    Output("reporting-edit-mode-store", "data"),
+    Input("reporting-edit-btn", "n_clicks"),
+    Input("reporting-data-store", "data"),
+    State("reporting-edit-mode-store", "data"),
+)
+def toggle_reporting_edit_mode(edit_clicks, records, edit_mode):
+    trigger = ctx.triggered_id
+    if trigger == "reporting-edit-btn":
+        return not bool(edit_mode)
+    if trigger == "reporting-data-store":
+        return False
+    return bool(edit_mode)
+
+
+@dash.callback(
+    Output("reporting-table", "columns"),
+    Output("reporting-table", "style_data_conditional"),
+    Output("reporting-edit-btn", "children"),
+    Output("reporting-edit-btn", "color"),
+    Output("reporting-revert-btn", "disabled"),
+    Output("reporting-update-btn", "disabled"),
+    Input("reporting-edit-mode-store", "data"),
+    Input("reporting-table", "data"),
+    State("reporting-data-store", "data"),
+)
+def update_reporting_edit_controls(edit_mode, table_rows, original_records):
+    changes = get_changed_cells(original_records, table_rows)
+    issues = validate_reporting_rows(table_rows)
+    styles = build_reporting_table_styles(changes, issues)
+    has_changes = bool(changes)
+    edit_mode = bool(edit_mode)
+
+    return (
+        build_reporting_table_columns(edit_mode),
+        styles,
+        "Exit Edit Mode" if edit_mode else "Edit Data",
+        "warning" if edit_mode else "secondary",
+        not (edit_mode and has_changes),
+        not (edit_mode and has_changes),
+    )
+
+
+@dash.callback(
+    Output("reporting-table", "data", allow_duplicate=True),
+    Input("reporting-revert-btn", "n_clicks"),
+    State("reporting-data-store", "data"),
+    State("reporting-athlete-options-store", "data"),
+    prevent_initial_call=True,
+)
+def revert_reporting_table_changes(n_clicks, records, athlete_options):
+    if not n_clicks:
+        raise PreventUpdate
+
+    table_rows, _, _, _, _ = update_reporting_table(records, athlete_options)
+    return table_rows
+
+
+@dash.callback(
+    Output("reporting-review-modal", "is_open"),
+    Output("reporting-change-summary", "children"),
+    Output("reporting-confirm-update-btn", "disabled"),
+    Input("reporting-update-btn", "n_clicks"),
+    Input("reporting-cancel-update-btn", "n_clicks"),
+    State("reporting-review-modal", "is_open"),
+    State("reporting-table", "data"),
+    State("reporting-data-store", "data"),
+    prevent_initial_call=True,
+)
+def toggle_reporting_review_modal(review_clicks, cancel_clicks, is_open, table_rows, original_records):
+    trigger = ctx.triggered_id
+    if trigger == "reporting-cancel-update-btn":
+        return False, no_update, True
+
+    if trigger != "reporting-update-btn":
+        raise PreventUpdate
+
+    changes = get_changed_cells(original_records, table_rows)
+    issues = validate_reporting_rows(table_rows)
+    return True, build_change_summary(changes, issues), bool(issues or not changes)
+
+
+@dash.callback(
     Output("reporting-data-store", "data", allow_duplicate=True),
     Output("reporting-update-msg", "children"),
     Output("reporting-update-msg", "color"),
     Output("reporting-update-msg", "is_open"),
-    Input("reporting-update-btn", "n_clicks"),
+    Output("reporting-review-modal", "is_open", allow_duplicate=True),
+    Input("reporting-confirm-update-btn", "n_clicks"),
     State("reporting-table", "data"),
     State("reporting-data-store", "data"),
     prevent_initial_call=True,
@@ -856,10 +1484,14 @@ def update_warehouse_records(n_clicks, edited_rows, original_records):
     edited_df = pd.DataFrame(edited_rows or [])
 
     if original_df.empty or edited_df.empty:
-        return no_update, "No rows loaded to update.", "warning", True
+        return no_update, "No rows loaded to update.", "warning", True, False
 
     if "__record_uuid" not in original_df.columns or "__record_uuid" not in edited_df.columns:
-        return no_update, "Update failed: warehouse record UUIDs are missing. Reload the data and try again.", "danger", True
+        return no_update, "Update failed: warehouse record UUIDs are missing. Reload the data and try again.", "danger", True, False
+
+    issues = validate_reporting_rows(edited_rows)
+    if issues:
+        return no_update, "Update blocked: resolve validation issues before saving.", "danger", True, True
 
     original_by_uuid = {
         str(row["__record_uuid"]): row
@@ -962,12 +1594,12 @@ def update_warehouse_records(n_clicks, edited_rows, original_records):
             updated_count += 1
 
     except WarehouseClientError as e:
-        return no_update, f"Update failed: {e}", "danger", True
+        return no_update, f"Update failed: {e}", "danger", True, False
     except Exception as e:
-        return no_update, f"Unexpected update error: {e}", "danger", True
+        return no_update, f"Unexpected update error: {e}", "danger", True, False
 
     if not updated_count:
-        return no_update, "No editable changes detected.", "info", True
+        return no_update, "No editable changes detected.", "info", True, False
 
     refreshed = []
     for row in original_df.to_dict("records"):
@@ -979,6 +1611,7 @@ def update_warehouse_records(n_clicks, edited_rows, original_records):
         f"Updated {updated_count} warehouse record(s).",
         "success",
         True,
+        False,
     )
 
 
