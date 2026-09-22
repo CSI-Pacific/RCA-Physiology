@@ -860,7 +860,6 @@ def _extract_record_payload(rec):
 
 def normalize_records_to_df(records):
     expected_cols = ["__record_uuid", "__dataset_uuid"] + REPORT_DATA_COLUMNS
-    expected_cols = ["__record_uuid", "__dataset_uuid"] + REPORT_DATA_COLUMNS
 
     if not records:
         return pd.DataFrame(columns=expected_cols)
@@ -872,7 +871,6 @@ def normalize_records_to_df(records):
         if c not in df.columns:
             df[c] = None
 
-    for c in REPORT_NUMERIC_COLUMNS:
     for c in REPORT_NUMERIC_COLUMNS:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -1146,7 +1144,6 @@ layout = dbc.Container(
                             html.Hr(),
                             dbc.Alert(id="reporting-status-msg", is_open=False),
                             dbc.Alert(id="reporting-update-msg", is_open=False),
-                            dbc.Alert(id="reporting-update-msg", is_open=False),
                         ],
                     ),
                     md=3,
@@ -1344,7 +1341,6 @@ def load_reporting_data(n_clicks, athlete_id, start_date, end_date, test_type, m
         if df.empty:
             return [], "No rows found for the selected filters.", "warning", True
 
-        records = dataframe_to_store_records(df)
         records = dataframe_to_store_records(df)
         return records, f"Loaded {len(df)} row(s) from warehouse.", "success", True
 
