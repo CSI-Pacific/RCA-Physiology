@@ -57,7 +57,7 @@ TOKEN_URL = f"{SITE_URL}/o/token/"
 # deployment needs no variable for it. Do not set CLIENT_ID in a hosting
 # panel: a blank or mistyped value there reaches the provider as "Invalid
 # client_id parameter value", which is far harder to read than this line.
-CLIENT_ID = _env("CLIENT_ID", "bDf3z9KwxSzCFtxabQ10UwlnHCMl2IsE5teZWLu4")
+CLIENT_ID =  "bDf3z9KwxSzCFtxabQ10UwlnHCMl2IsE5teZWLu4"
 
 # The secret is the one value this repo cannot carry -- the repo is public.
 # Set CLIENT_SECRET in the deployment's environment variables.
@@ -66,7 +66,7 @@ CLIENT_ID = _env("CLIENT_ID", "bDf3z9KwxSzCFtxabQ10UwlnHCMl2IsE5teZWLu4")
 # secret as the second argument below. It then ships to GitHub in the clear
 # on the next push, so only do that with a secret you are willing to treat as
 # public, and rotate it if that stops being true.
-CLIENT_SECRET = _env("CLIENT_SECRET", "em7L8NeqjKP8vxTEYRz7LrnHKz7aU8pm7t0DfbCiyQkljgz2YEyf7j2wCfWuN3m21QfKehzAwkwBc8boXGYSOJWFm6PAif4iHQ3kbT5xZ5safDeBlt03YDgqr5EhooYR")
+CLIENT_SECRET =  "em7L8NeqjKP8vxTEYRz7LrnHKz7aU8pm7t0DfbCiyQkljgz2YEyf7j2wCfWuN3m21QfKehzAwkwBc8boXGYSOJWFm6PAif4iHQ3kbT5xZ5safDeBlt03YDgqr5EhooYR"
 FLASK_SECRET_KEY = _env("FLASK_SECRET_KEY")
 
 SPORT_ORG_ENDPOINT = "/api/registration/organization/"
