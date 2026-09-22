@@ -17,7 +17,7 @@ class Footer():
                 dbc.Container([
 
                     html.P(
-                        "© 2025 CSI Pacific",
+                        "© 2026 CSI Pacific",
                         className="col-md-4 mb-0"
                     ),
 

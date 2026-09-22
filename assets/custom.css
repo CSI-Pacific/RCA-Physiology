@@ -78,3 +78,162 @@ body {
 .SingleDatePickerInput {
   width: 100% !important;
 }
+
+.erg-date-controls {
+  position: relative;
+  z-index: 5000;
+}
+
+.erg-date-controls .SingleDatePicker_picker {
+  z-index: 6000 !important;
+}
+
+/* ---------------------------------------------------------
+   Entry page: pinned status messages.
+   Submit results and session-expiry warnings used to sit at the bottom of a
+   narrow column, out of view while the practitioner worked in the table.
+   The footer is fixed at 100px, so clear it.
+   --------------------------------------------------------- */
+.entry-status-stack {
+  position: fixed;
+  right: 16px;
+  bottom: 112px;
+  z-index: 1080;
+  width: min(420px, calc(100vw - 32px));
+  /* let clicks through the empty gaps in the stack */
+  pointer-events: none;
+}
+
+.entry-status-stack .alert {
+  pointer-events: auto;
+  margin-bottom: 0.5rem;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.entry-status-stack .alert:last-child {
+  margin-bottom: 0;
+}
+
+@media (max-width: 576px) {
+  .entry-status-stack {
+    left: 16px;
+    right: 16px;
+    bottom: 108px;
+    width: auto;
+  }
+}
+
+/* ---------------------------------------------------------
+   Entry page: erg batch entry.
+   One toolbar above the table instead of two stacked rows, so the date
+   control, the row actions and the push button read as one set of controls
+   over the same table.
+   --------------------------------------------------------- */
+.erg-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem 1.25rem;
+  padding: 0.75rem 1rem;
+  background-color: #f8f9fa;
+  border: 1px solid #e9ecef;
+  border-radius: 8px;
+}
+
+.erg-toolbar-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.erg-toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.erg-toolbar-label {
+  margin-bottom: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #6c757d;
+}
+
+/* The date picker sets width: 100% globally further up this file; inside the
+   toolbar it needs to size to its content instead. */
+.erg-toolbar .SingleDatePicker,
+.erg-toolbar .SingleDatePickerInput,
+.erg-toolbar .DateInput {
+  width: auto !important;
+}
+
+.erg-toolbar .DateInput_input {
+  font-size: 0.875rem;
+  padding: 5px 8px;
+}
+
+@media (max-width: 767px) {
+  .erg-toolbar-field.ms-auto {
+    margin-left: 0 !important;
+  }
+
+  .erg-toolbar-field,
+  .erg-toolbar-group {
+    width: 100%;
+  }
+
+  .erg-toolbar-group .btn {
+    flex: 1 1 0;
+  }
+}
+
+.erg-table-wrap {
+  position: relative;
+  z-index: 1;
+  margin-bottom: 1rem;
+}
+
+/* ---------------------------------------------------------
+   DataTable dropdowns.
+   The table body scrolls, so a menu opened on a lower row used to be clipped
+   by the bottom edge of the table. assets/table_dropdown_position.js re-anchors
+   the open menu to the viewport with position: fixed and flips it above the
+   cell when there is no room below; these rules only cover its appearance.
+   --------------------------------------------------------- */
+.dash-table-container .Select-menu-outer {
+  background-color: #fff;
+  border: 1px solid #adb5bd;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+}
+
+.dash-table-container .Select-menu-outer .Select-option {
+  border-radius: 6px;
+}
+
+/* ---------------------------------------------------------
+   Page titles.
+   Shared with the other RCA apps (RCA Performance Analysis) so a
+   practitioner moving between them reads the same header: a red eyebrow
+   naming the app, the page name, then one line of what the page is for.
+   --------------------------------------------------------- */
+:root {
+  --csi-red: #c1121f;
+  --csi-red-dark: #8f0d17;
+  --csi-red-soft: rgba(193, 18, 31, 0.15);
+}
+
+.page-eyebrow {
+  color: var(--csi-red);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.13em;
+}
+
+.page-title-header h1 {
+  font-size: clamp(1.8rem, 3vw, 2.55rem);
+  font-weight: 750;
+  letter-spacing: -0.035em;
+}

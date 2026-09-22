@@ -1,0 +1,4 @@
+athlete,profile_id,test_date,distance_m,stroke_rate_spm,power_w,time_min,time_s
+Example Athlete,,2026-09-15,2000,32,245,7,12.4
+Example Athlete,,2026-09-15,6000,26,205,23,4.8
+Sample Athlete-Two,,2026-09-15,2000,34,398,6,8.1

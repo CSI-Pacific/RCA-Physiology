@@ -1,0 +1,6 @@
+athlete,profile_id,test_date,body_mass_kg,test_type,mode,notes,step_no,step_type,target_power_w,actual_power_w,heart_rate_bpm,lactate_mmol,vo2,stroke_rate_spm,rpe,time_s
+Example Athlete,,2026-09-15,72.4,erg_C2,Submax,Pre-camp step test,1,Submax,150,152,128,1.2,,20,11,240
+Example Athlete,,2026-09-15,72.4,erg_C2,Submax,Pre-camp step test,2,Submax,180,181,141,1.8,,22,13,240
+Example Athlete,,2026-09-15,72.4,erg_C2,Submax,Pre-camp step test,3,Max,240,244,178,6.4,,30,19,240
+Sample Athlete-Two,,2026-09-15,84.1,erg_C2,Submax,,1,Submax,200,199,122,1.1,,19,10,240
+Sample Athlete-Two,,2026-09-15,84.1,erg_C2,Submax,,2,Submax,240,242,139,1.9,,21,13,240

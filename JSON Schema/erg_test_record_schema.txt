@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://csipacific.ca/schemas/erg_test_record.schema.json",
+  "title": "Erg Test Record",
+  "description": "One record per athlete row ingested from the batch erg entry table in pages/entry.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "profile_id",
+    "test_date",
+    "distance_m",
+    "power_w",
+    "time_min",
+    "time_s"
+  ],
+  "properties": {
+    "row_no": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional display row number from the batch entry table."
+    },
+    "profile_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Athlete profile ID (subject_field)."
+    },
+    "test_date": {
+      "type": "string",
+      "format": "date",
+      "description": "Date of the erg test (YYYY-MM-DD)."
+    },
+    "distance_m": {
+      "type": "integer",
+      "enum": [
+        2000,
+        6000
+      ],
+      "description": "Erg test distance in metres."
+    },
+    "stroke_rate_spm": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Average stroke rate in strokes per minute. Missing or non-positive source values are submitted as 0.1."
+    },
+    "power_w": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Average power output in watts. Missing or non-positive source values are submitted as 0.1."
+    },
+    "time_min": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Elapsed test time in minutes."
+    },
+    "time_s": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Elapsed test time in seconds."
+    }
+  }
+}

@@ -158,14 +158,16 @@ layout = dbc.Container(
 
         dbc.Row(
             dbc.Col(
-                html.Div(
-                    [
-                        html.H2("Rowing Canada Moxy Analysis", className="mb-3"),
-                    ]
-                ),
-                width=12,
+                [
+                    html.Div("PHYSIOLOGY", className="page-eyebrow"),
+                    html.H1("Moxy Analysis", className="mb-1"),
+                    html.P(
+                        "Upload a Moxy session and review SmO2 and THb across the piece.",
+                        className="text-muted mb-0",
+                    ),
+                ]
             ),
-            className="mt-3",
+            className="page-title-header align-items-center mt-4 mb-4",
         ),
 
         dbc.Row(

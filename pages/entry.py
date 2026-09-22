@@ -10,6 +10,7 @@ import dash
 from dash import html, dcc, dash_table, Input, Output, State, ctx, no_update
 import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
+from dash_auth_external.exceptions import TokenExpiredError
 
 import plotly.express as px
 import plotly.graph_objects as go
@@ -17,77 +18,50 @@ import plotly.graph_objects as go
 from auth_setup import auth
 from utils import fetch_profiles
 
-from settings import SITE_URL, VO2_STEP_SOURCE_UUID
+from settings import SITE_URL, VO2_STEP_SOURCE_UUID, ERG_TEST_SOURCE_UUID
+from bulk_templates import (
+    ERG_TEMPLATE_COLUMNS,
+    STEP_TEMPLATE_COLUMNS,
+    erg_template_csv,
+    step_template_csv,
+)
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
 import base64
+import hashlib
 import io
+import json
+import re
 
 cfg = WarehouseAPIConfig(base_url=SITE_URL)
 wc = WarehouseClient(cfg, token_getter=auth.get_token)
 
 dash.register_page(__name__, path="/entry", name="Data Entry")
 
-# === One-off batch upload settings (remove after use) ===
-SPORT_ORG_ID = 13  # adjust to your org ID if needed
-BATCH_UPLOAD_DRY_RUN = False  # set False to actually push data
+# Every athlete list on this page is drawn from one org.
+SPORT_ORG_ID = 13
 
-# Set to False to hide the batch-upload UI; the batch code still remains available.
-ENABLE_BATCH_UPLOAD_UI = True
+AUTH_KEEPALIVE_INTERVAL_MS = 4 * 60 * 1000
+MISSING_ERG_NUMERIC_VALUE = 0.1
 
-# Optional overrides for athlete names in the uploaded CSV.
-# Keys are values from the 'About' column; values are profile_id (preferred) or exact full name.
-MANUAL_PROFILE_MAP = {
-    #"Payton  Gauthier": 1234,
-    # "Athlete 2": "Jane Smith",
-}
+# Entered data survives a refresh, a mis-click on the navbar, and the
+# token-expiry redirect. "session" (not "local") is deliberate: a fresh tab
+# starts clean, so a shared erg-room tablet never shows the previous
+# practitioner's athlete and risk mis-attributing a test.
+PERSISTENCE_TYPE = "session"
 
-# Athletes to ignore when uploading (their rows will be skipped).
-# Use the exact string as it appears in the 'About' column of the CSV.
-SKIP_ATHLETES = {
-    "Annika Goodwyn", 
-    "Cait Whittard", 
-    "Carter Cranmer-Smith", 
-    "Conor Dillon",
-    "Janette Peachey",
-    "Joseph McCoy", 
-    "Kamal Elbogdadi", 
-    "Lexi Shimnowski", 
-    "Madelyn Vandermeer", 
-    "Tess Friar", 
-    "Daniel de Groot", 
-    "Andrew Hubbard", 
-    "Claire Ellison", 
-    "Euan Coulson", 
-    "Jack (John) Walkey",
-    "Jennifer Casson", 
-    "Joshua King", 
-    "Kai Bartel",
-    "Kyle Nummi", 
-    "Leia Till",
-    "Liam Keane",
-    "Lisa Samuel",
-    "Luke Gadsdon",
-    "Michael Caryk",
-    "Mitchell Rodgers",
-    "Olivia McMurray", 
-    "Rebecca Zimmerman",
-    "William Simpson", 
-    "Emily Munroe", 
-    "Gavin Stone", 
-
-}
-
-# If set, only upload this athlete's rows (matching 'About', case-insensitive).
-# Useful for testing a single athlete before uploading the full file.
-TEST_ONLY_ATHLETE = None # e.g. "Jane Smith"
 
 # =========================================================
 # STEP TEST TABLE
 # =========================================================
-DEFAULT_ROWS = [
-    {
-        "step_no": 1,
-        "Type": "Submax",
+DEFAULT_TEST_TYPE = "erg_C2"
+DEFAULT_MODE = "Submax"
+DEFAULT_STEP_ROW_COUNT = 3
+
+
+def blank_step_row(step_no=None, mode=DEFAULT_MODE):
+    return {
+        "step_no": step_no,
+        "Type": mode,
         "T_PO": None,
         "A_PO": None,
         "HR": None,
@@ -97,34 +71,13 @@ DEFAULT_ROWS = [
         "split": None,
         "rpe": None,
         "time_s": None,
-    },
-    {
-        "step_no": 2,
-        "Type": "Submax",
-        "T_PO": None,
-        "A_PO": None,
-        "HR": None,
-        "La": None,
-        "V02": None,
-        "rate": None,
-        "split": None,
-        "rpe": None,
-        "time_s": None,
-    },
-    {
-        "step_no": 3,
-        "Type": "Submax",
-        "T_PO": None,
-        "A_PO": None,
-        "HR": None,
-        "La": None,
-        "V02": None,
-        "rate": None,
-        "split": None,
-        "rpe": None,
-        "time_s": None,
-    },
-]
+    }
+
+
+def blank_step_rows(n=DEFAULT_STEP_ROW_COUNT, mode=DEFAULT_MODE):
+    """Fresh row dicts. A factory, not a constant, so Reset and the layout
+    never hand callbacks the same mutable objects."""
+    return [blank_step_row(i + 1, mode) for i in range(n)]
 
 TABLE_COLUMNS = [
     {"name": "Step Number", "id": "step_no", "type": "numeric"},
@@ -144,20 +97,124 @@ TABLE_COLUMNS = [
 # =========================================================
 # ERG TEST TABLE (each row = one athlete)
 # =========================================================
-ERG_DEFAULT_ROWS = [
-    {"row_no": 1, "profile_id": "", "distance_m": None, "stroke_rate_spm": None, "power_w": None, "time_s": None},
-    {"row_no": 2, "profile_id": "", "distance_m": None, "stroke_rate_spm": None, "power_w": None, "time_s": None},
-    {"row_no": 3, "profile_id": "", "distance_m": None, "stroke_rate_spm": None, "power_w": None, "time_s": None},
-]
+ERG_DEFAULT_ROW_COUNT = 3
+
+
+def blank_erg_row(row_no=None, test_date=None):
+    return {
+        "row_no": row_no,
+        "profile_id": "",
+        "test_date": test_date or date.today().isoformat(),
+        "distance_m": None,
+        "stroke_rate_spm": None,
+        "power_w": None,
+        "time_min": None,
+        "time_s": None,
+    }
+
+
+def blank_erg_rows(n=ERG_DEFAULT_ROW_COUNT):
+    return [blank_erg_row(i + 1) for i in range(n)]
 
 ERG_TABLE_COLUMNS = [
     {"name": "Row", "id": "row_no", "type": "numeric"},
+    {"name": "Test Date", "id": "test_date", "type": "text"},
     {"name": "Athlete", "id": "profile_id", "type": "text", "presentation": "dropdown"},
     {"name": "Distance (m)", "id": "distance_m", "type": "numeric", "presentation": "dropdown"},
     {"name": "Stroke Rate (spm)", "id": "stroke_rate_spm", "type": "numeric"},
     {"name": "Power (W)", "id": "power_w", "type": "numeric"},
+    {"name": "Time (min)", "id": "time_min", "type": "numeric"},
     {"name": "Time (s)", "id": "time_s", "type": "numeric"},
 ]
+
+ERG_UPLOAD_COLUMN_ALIASES = {
+    "row_no": {"rowno", "row", "rownumber"},
+    "profile_id": {"profileid", "athleteid", "subjectid"},
+    "athlete": {"athlete", "name", "fullname", "athletename", "about"},
+    "test_date": {"testdate", "date", "testday"},
+    "distance_m": {"distancem", "distance", "metres", "meters", "ergdistance"},
+    "stroke_rate_spm": {
+        "strokeratespm",
+        "strokerate",
+        "rate",
+        "averagestrokerate",
+        "avgrate",
+        "spm",
+    },
+    "power_w": {"powerw", "power", "watts", "avgpower", "averagepower"},
+    "time_min": {"timemin", "timeminutes", "minutes", "elapsedmin", "elapsedminutes"},
+    "time_s": {"times", "timesec", "timeseconds", "seconds", "elapsedsec", "elapsedseconds"},
+    "time": {"time", "elapsedtime", "resulttime", "score"},
+}
+
+# =========================================================
+# BULK STEP TEST UPLOAD FORMAT
+# =========================================================
+# Headers are matched with case, spaces, underscores and punctuation ignored,
+# so "Heart Rate", "heart_rate_bpm" and "HR" all land on the same field. That
+# is what lets a practitioner upload the sheet they already keep instead of
+# re-typing it into ours.
+STEP_UPLOAD_COLUMN_ALIASES = {
+    "profile_id": {"profileid", "athleteid", "subjectid"},
+    "athlete": {"athlete", "athletename", "name", "fullname", "about", "rower"},
+    "test_date": {"testdate", "date", "testday", "sessiondate"},
+    "body_mass_kg": {
+        "bodymasskg", "bodymass", "bodyweightkg", "bodyweight",
+        "weightkg", "weight", "masskg", "mass",
+    },
+    "test_type": {"testtype", "modality", "ergtype", "equipment"},
+    "mode": {"mode", "submaxmax", "maxsubmax", "testmode"},
+    "notes": {"notes", "note", "comments", "comment"},
+    "step_no": {"stepno", "step", "stepnumber", "stage", "stageno", "stagenumber"},
+    "step_type": {"steptype", "stagetype", "rowtype"},
+    "target_power_w": {
+        "targetpowerw", "targetpower", "targetpo", "targetwatts", "tpo",
+    },
+    "actual_power_w": {
+        "actualpowerw", "actualpower", "actualpo", "power", "powerw",
+        "watts", "po", "apo",
+    },
+    "heart_rate_bpm": {"heartratebpm", "heartrate", "hr", "hrbpm", "bpm"},
+    "lactate_mmol": {"lactatemmol", "lactate", "bloodlactate", "la", "bla"},
+    "vo2": {"vo2", "v02", "vo2lmin", "vo2absolute"},
+    "stroke_rate_spm": {"strokeratespm", "strokerate", "rate", "spm", "cadence"},
+    "rpe": {"rpe", "perceivedexertion", "borg"},
+    "time_s": {
+        "times", "timeins", "timeinstep", "timeinsteps", "stepduration",
+        "stepdurations", "duration", "durations", "timeseconds",
+    },
+}
+
+# An athlete is named by either column, so neither is listed here; the parser
+# reports a row that carries neither.
+STEP_UPLOAD_REQUIRED_COLUMNS = ("test_date", "step_no")
+
+STEP_NUMERIC_FIELDS = {
+    "body_mass_kg": "body mass",
+    "target_power_w": "target power",
+    "actual_power_w": "actual power",
+    "heart_rate_bpm": "heart rate",
+    "lactate_mmol": "lactate",
+    "vo2": "VO2",
+    "stroke_rate_spm": "stroke rate",
+    "time_s": "time in step",
+}
+
+STEP_MODE_VALUES = {"max": "Max", "submax": "Submax"}
+
+STEP_TEST_TYPE_VALUES = ("erg_C2", "erg_RP3", "row", "bike", "other")
+
+BULK_STEP_PREVIEW_COLUMNS = [
+    {"name": "Athlete", "id": "athlete", "type": "text"},
+    {"name": "Profile ID", "id": "profile_id", "type": "numeric"},
+    {"name": "Test Date", "id": "test_date", "type": "text"},
+    {"name": "Test Type", "id": "test_type", "type": "text"},
+    {"name": "Mode", "id": "mode", "type": "text"},
+    {"name": "Steps", "id": "steps", "type": "numeric"},
+    {"name": "Body Mass (kg)", "id": "body_mass_kg", "type": "numeric"},
+    {"name": "Session ID", "id": "session_id", "type": "text"},
+]
+
 
 # =========================================================
 # ZONES TABLE
@@ -199,6 +256,23 @@ def make_card(title, body):
     )
 
 
+def auth_relogin_message(action="continue"):
+    return (
+        f"Your login session has expired. Re-authenticate in another tab, then return here to {action}. "
+        "The data currently entered in this page should remain in the table while this tab stays open."
+    )
+
+
+def is_auth_error(exc):
+    if isinstance(exc, TokenExpiredError):
+        return True
+    if isinstance(exc, ValueError) and "token" in str(exc).lower():
+        return True
+    if isinstance(exc, WarehouseClientError) and "token" in str(exc).lower():
+        return True
+    return False
+
+
 def to_float(x):
     try:
         if x is None or x == "":
@@ -208,8 +282,77 @@ def to_float(x):
         return None
 
 
+def simplify_header(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def normalize_person_name(value):
+    """Lower-cased, whitespace-collapsed name — 'JOHN   DOE' -> 'john doe'."""
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def loose_person_name(value):
+    """Letters and digits only, so hyphens, apostrophes and spacing stop mattering."""
+    return re.sub(r"[^a-z0-9]+", "", normalize_person_name(value))
+
+
+# Fields that define a submission's identity. session_id/session_ts are
+# excluded on purpose: they are regenerated on every click, so including them
+# would make every duplicate look unique.
+FINGERPRINT_FIELDS = (
+    "profile_id",
+    "test_date",
+    "body_mass_kg",
+    "test_type",
+    "mode",
+    "notes",
+    "step_no",
+    "step_type",
+    "target_po_w",
+    "actual_po_w",
+    "hr_bpm",
+    "lactate_mmol",
+    "vo2",
+    "rate_spm",
+    "split_sec_per_500",
+    "rpe",
+    "time_s",
+)
+
+
+def draft_is_restorable(rows):
+    """True for any real saved table state.
+
+    Deliberately not a "did they type anything" test: the draft also carries
+    the row *count*, so a practitioner who deleted down to one row or added a
+    ninth step gets that back rather than the three default rows. Restoring a
+    draft of blank rows over blank rows is a harmless no-op; losing their row
+    structure is not.
+    """
+    return (
+        isinstance(rows, list)
+        and len(rows) > 0
+        and all(isinstance(row, dict) for row in rows)
+    )
+
+
+def submission_fingerprint(records):
+    """Stable hash of the data being ingested, ignoring per-click timestamps.
+
+    Lets us recognise a second click that would push the exact same test again
+    under a brand new session_id, which nothing downstream could dedupe.
+    """
+    trimmed = [
+        {k: to_float(r.get(k)) if k not in ("test_type", "mode", "notes", "step_type", "test_date") else r.get(k)
+         for k in FINGERPRINT_FIELDS}
+        for r in records
+    ]
+    blob = json.dumps(trimmed, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
 # --------------------------------------------------
-# ONE-OFF BATCH-UPLOAD HELPERS (remove after use)
+# SHARED CSV VALUE PARSING
 # --------------------------------------------------
 
 def clean_value(x):
@@ -274,224 +417,430 @@ def map_test_type(test_type, other_test_type=None):
     return None
 
 
-def resolve_profile_id(csv_name, by_name):
-    """Resolve CSV athlete name to profile_id."""
-    csv_name = clean_value(csv_name)
-    if csv_name is None:
+def canonical_columns(columns, alias_map):
+    """Map a sheet's headers onto our field names.
+
+    A field is claimed by the first header that matches it, so a sheet
+    carrying both "Power" and "Actual PO" keeps the leftmost rather than
+    letting the rename silently collapse the two into one column.
+    """
+    canonical = {}
+    used = set()
+    for column in columns:
+        simplified = simplify_header(column)
+        for target, aliases in alias_map.items():
+            if target not in used and simplified in aliases:
+                canonical[column] = target
+                used.add(target)
+                break
+    return canonical
+
+
+def canonical_erg_upload_columns(columns):
+    return canonical_columns(columns, ERG_UPLOAD_COLUMN_ALIASES)
+
+
+def parse_time_to_seconds(value):
+    value = clean_value(value)
+    if value is None:
         return None
 
-    # manual direct mapping
-    if csv_name in MANUAL_PROFILE_MAP:
-        mapped = MANUAL_PROFILE_MAP[csv_name]
-        if isinstance(mapped, int):
-            return mapped
-        if isinstance(mapped, str):
-            return by_name.get(mapped.strip().lower())
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return float(value)
 
-    # exact match
-    return by_name.get(str(csv_name).strip().lower())
+    text = str(value).strip()
+    if not text:
+        return None
 
-
-def prepare_batch_dataframe(contents, filename):
-    """Parse uploaded CSV contents into a cleaned DataFrame."""
-    if not contents:
-        raise ValueError("No file content provided.")
-
-    header, encoded = contents.split(",", 1)
-    data = base64.b64decode(encoded)
-
-    if filename.lower().endswith(".csv"):
-        df = pd.read_csv(io.StringIO(data.decode("utf-8")))
-    else:
-        raise ValueError("Only CSV uploads are supported.")
-
-    required_cols = [
-        "Date",
-        "About",
-        "Body Weight (kg)",
-        "Test Type",
-        "Other Test Type",
-        "Notes",
-        "Step Number",
-        "Submax/Max",
-        "Target PO",
-        "Actual PO",
-        "Heart Rate",
-        "Blood Lactate",
-        "VO2",
-        "Stroke Rate",
-        "Split",
-        "RPE",
-    ]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"CSV is missing required columns: {missing}")
-
-    for c in df.columns:
-        if df[c].dtype == object:
-            df[c] = df[c].apply(clean_value)
-
-    df["test_date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-    if df["test_date"].isna().any():
-        bad_rows = df[df["test_date"].isna()][["Date", "About"]]
-        raise ValueError(f"Some dates could not be parsed:\n{bad_rows}")
-
-    numeric_map = {
-        "Body Weight (kg)": "body_mass_kg",
-        "Step Number": "step_no",
-        "Target PO": "target_po_w",
-        "Actual PO": "actual_po_w",
-        "Heart Rate": "hr_bpm",
-        "Blood Lactate": "lactate_mmol",
-        "VO2": "vo2",
-        "Stroke Rate": "rate_spm",
-        "Split": "split_sec_per_500",
-    }
-    for src, dst in numeric_map.items():
-        df[dst] = pd.to_numeric(df[src], errors="coerce")
-
-    df["rpe"] = df["RPE"].apply(parse_rpe)
-    df["step_type"] = df["Submax/Max"].apply(clean_value)
-    df["mode"] = df["Submax/Max"].apply(clean_value)
-    df["notes_clean"] = df["Notes"].apply(clean_value)
-    df["test_type_clean"] = df.apply(
-        lambda r: map_test_type(r["Test Type"], r["Other Test Type"]),
-        axis=1,
-    )
-
-    session_group = [
-        "About",
-        "test_date",
-        "Test Type",
-        "Other Test Type",
-        "Notes",
-    ]
-
-    df["body_mass_kg"] = (
-        df.groupby(session_group, dropna=False)["body_mass_kg"]
-        .transform(lambda s: s.ffill().bfill())
-    )
-
-    return df
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            hours, minutes, seconds = parts
+            return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+        if len(parts) == 2:
+            minutes, seconds = parts
+            return float(minutes) * 60 + float(seconds)
+        return float(text)
+    except ValueError:
+        return None
 
 
-def build_batch_records(df, by_name):
-    """Turn a cleaned batch DataFrame into warehouse records.
+def split_total_seconds(total_seconds):
+    total_seconds = to_float(total_seconds)
+    if total_seconds is None:
+        return None, None
 
-    Returns:
-        (records, skipped_names)
-    """
-    df = df.copy()
-    df["profile_id"] = df["About"].apply(lambda x: resolve_profile_id(x, by_name))
+    minutes = int(total_seconds // 60)
+    seconds = round(total_seconds - (minutes * 60), 2)
+    if seconds >= 60:
+        minutes += 1
+        seconds = round(seconds - 60, 2)
+    return minutes, seconds
 
-    # Skip athletes explicitly listed in SKIP_ATHLETES
-    skipped = sorted(
-        df.loc[
-            df["About"].isin(SKIP_ATHLETES),
-            "About",
-        ]
-        .dropna()
-        .unique()
-        .tolist()
-    )
-    if skipped:
-        df = df[~df["About"].isin(SKIP_ATHLETES)]
 
-    # Report any remaining unmatched athletes
-    unmatched = sorted(df.loc[df["profile_id"].isna(), "About"].dropna().unique().tolist())
-    if unmatched:
-        raise ValueError(
-            "Could not resolve these CSV athlete names to profile_id:\n"
-            + "\n".join(f" - {name}" for name in unmatched)
-            + "\n\nAdd them to MANUAL_PROFILE_MAP, or add them to SKIP_ATHLETES to ignore them."
-        )
+def normalize_erg_time_parts(time_min=None, time_s=None, time_value=None, split_sec_per_500=None, distance=None):
+    minute_part = pd.to_numeric(time_min, errors="coerce")
+    second_part = pd.to_numeric(time_s, errors="coerce")
 
-    # Convert to int once we know all are resolved
-    df["profile_id"] = df["profile_id"].astype(int)
+    if pd.notna(minute_part) and pd.notna(second_part):
+        return int(float(minute_part)), round(float(second_part), 2)
 
-    # Validate required numeric fields before ingesting, so we can give a helpful error
-    missing_step_no = df[df["step_no"].isna()]
-    if not missing_step_no.empty:
-        first = missing_step_no.iloc[0]
-        raise ValueError(
-            "Missing 'Step Number' (required) for some rows. "
-            f"First missing row: About={first.get('About')!r}, Date={first.get('Date')!r}. "
-            "Please ensure all rows have a 'Step Number'."
-        )
+    total_seconds = parse_time_to_seconds(time_value)
+    if total_seconds is None:
+        total_seconds = parse_time_to_seconds(time_s)
+    if total_seconds is None and pd.notna(minute_part):
+        total_seconds = float(minute_part) * 60
 
-    session_group = [
-        "profile_id",
-        "test_date",
-        "test_type_clean",
-        "notes_clean",
-    ]
+    split_s = parse_time_to_seconds(split_sec_per_500)
+    if total_seconds is None and split_s is not None and distance is not None:
+        total_seconds = split_s * (float(distance) / 500)
 
-    sessions = (
-        df[session_group]
-        .drop_duplicates()
-        .sort_values(session_group)
-        .reset_index(drop=True)
-    )
-    sessions["session_idx"] = range(1, len(sessions) + 1)
+    return split_total_seconds(total_seconds)
 
-    df = df.merge(sessions, on=session_group, how="left")
 
-    df["session_ts"] = df["test_date"].apply(
-        lambda d: datetime(d.year, d.month, d.day, 12, 0, 0).isoformat(timespec="seconds")
-    )
-    df["session_id"] = df.apply(
-        lambda r: f"{int(r['profile_id'])}_{r['test_date'].strftime('%Y%m%d')}_{int(r['session_idx']):03d}",
-        axis=1,
-    )
+def coerce_erg_positive_number(value):
+    if value in (None, ""):
+        return MISSING_ERG_NUMERIC_VALUE
+    if str(value).strip().upper() == "NA":
+        return MISSING_ERG_NUMERIC_VALUE
 
-    records = []
-    for _, r in df.iterrows():
-        step_no_val = clean_value(r["step_no"])
-        if step_no_val is None:
-            # Should not happen due to earlier validation, but guard defensively.
-            raise ValueError(
-                f"Missing step number for athlete={r.get('About')!r}, date={r.get('Date')!r}."
-            )
-        try:
-            step_no_val = int(float(step_no_val))
-        except Exception:
-            raise ValueError(
-                f"Invalid step number {step_no_val!r} for athlete={r.get('About')!r}, date={r.get('Date')!r}."
-            )
+    value = float(value)
+    if value <= 0:
+        return MISSING_ERG_NUMERIC_VALUE
+    return value
 
-        records.append(
+
+def parse_upload_date(value):
+    value = clean_value(value)
+    if value is None:
+        return None
+
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date().isoformat()
+
+
+def athlete_lookup_from_options(options):
+    by_name = {}
+    by_id = set()
+    loose = {}
+
+    for opt in options or []:
+        label = str(opt.get("label", "")).strip()
+        value = str(opt.get("value", "")).strip()
+        if label and value:
+            by_name[normalize_person_name(label)] = value
+            loose.setdefault(loose_person_name(label), set()).add(value)
+        if value:
+            by_id.add(value)
+
+    # A punctuation-blind key only earns a place when exactly one athlete owns
+    # it. Where two would collide the key is dropped, so the upload reports an
+    # unmatched name rather than quietly filing a test under the wrong athlete.
+    for key, values in loose.items():
+        if len(values) == 1 and key not in by_name:
+            by_name[key] = next(iter(values))
+
+    return by_name, by_id
+
+
+def uploaded_name_lookup_keys(name):
+    name = str(name or "").strip()
+    if not name:
+        return []
+
+    keys = [normalize_person_name(name)]
+    if "," in name:
+        last, first = [part.strip() for part in name.split(",", 1)]
+        if first and last:
+            keys.append(normalize_person_name(f"{first} {last}"))
+
+    # Appended last so an exact match is always tried before a looser one.
+    keys.extend(loose_person_name(key) for key in list(keys))
+
+    return [key for key in dict.fromkeys(keys) if key]
+
+
+def resolve_uploaded_profile_id(raw, by_name, unresolved_names):
+    profile_id = clean_value(raw.get("profile_id"))
+    athlete_name = clean_value(raw.get("athlete"))
+
+    if profile_id is not None:
+        profile_id = str(profile_id).strip()
+        if profile_id.endswith(".0"):
+            profile_id = profile_id[:-2]
+        return profile_id
+
+    if athlete_name is not None:
+        profile_id = None
+        for key in uploaded_name_lookup_keys(athlete_name):
+            profile_id = by_name.get(key)
+            if profile_id is not None:
+                break
+        if profile_id is None:
+            unresolved_names.append(str(athlete_name))
+        return profile_id
+
+    return None
+
+
+def finalize_erg_upload_rows(rows, skipped_names=None):
+    incomplete = 0
+    for i, row in enumerate(rows, start=1):
+        row["row_no"] = i
+        required = ["profile_id", "test_date", "distance_m"]
+        is_incomplete = any(row.get(field) in (None, "") for field in required)
+        if row.get("time_min") in (None, "") and row.get("time_s") in (None, ""):
+            is_incomplete = True
+        if is_incomplete:
+            incomplete += 1
+    return rows, incomplete, sorted(set(skipped_names or []))
+
+
+ERG_DATA_FIELDS = (
+    "profile_id",
+    "distance_m",
+    "stroke_rate_spm",
+    "power_w",
+    "time_min",
+    "time_s",
+)
+
+ERG_FIELD_LABELS = {
+    "profile_id": "athlete",
+    "test_date": "test date",
+    "distance_m": "distance (m)",
+    "stroke_rate_spm": "stroke rate",
+    "power_w": "power",
+    "time_min": "time (min)",
+    "time_s": "time (s)",
+}
+
+
+# A row the practitioner has started but not finished is the one thing the
+# push refuses; tinting the offending cell says so before they press the
+# button. A row where nothing at all is filled in is ignored on push, so it is
+# left alone here too.
+#
+# Written as "not every field is blank" rather than the more obvious "any field
+# is filled": the DataTable filter grammar has no "is not blank" operator, and
+# its one negation ("!") is only accepted at the start of a query or straight
+# after a logical operator -- never after an opening bracket.
+ERG_ROW_STARTED = "!(" + " && ".join(
+    "{%s} is blank" % field for field in ERG_DATA_FIELDS
+) + ")"
+
+
+def erg_missing_cell_styles():
+    styles = []
+    for field in ("profile_id", "test_date", "distance_m"):
+        styles.append(
             {
-                "profile_id": int(r["profile_id"]),
-                "session_id": r["session_id"],
-                "session_ts": r["session_ts"],
-                "test_date": r["test_date"].date().isoformat(),
-                "body_mass_kg": clean_value(r["body_mass_kg"]),
-                "test_type": clean_value(r["test_type_clean"]),
-                "mode": clean_value(r["mode"]),
-                "notes": clean_value(r["notes_clean"]) or "",  # schema requires a string (not null)
-                "step_no": step_no_val,
-                "step_type": clean_value(r["step_type"]),
-                "target_po_w": clean_value(r["target_po_w"]),
-                "actual_po_w": clean_value(r["actual_po_w"]),
-                "hr_bpm": clean_value(r["hr_bpm"]),
-                "lactate_mmol": clean_value(r["lactate_mmol"]),
-                "vo2": clean_value(r["vo2"]),
-                "rate_spm": clean_value(r["rate_spm"]),
-                "split_sec_per_500": clean_value(r["split_sec_per_500"]),
-                "rpe": clean_value(r["rpe"]),
-                "time_s": None,
+                "if": {
+                    "filter_query": "%s && {%s} is blank" % (ERG_ROW_STARTED, field),
+                    "column_id": field,
+                },
+                "backgroundColor": "#fdecea",
+                "border": "1px solid #f5c2c7",
             }
         )
 
-    return records, skipped
+    for field in ("time_min", "time_s"):
+        styles.append(
+            {
+                "if": {
+                    "filter_query": (
+                        "%s && {time_min} is blank && {time_s} is blank" % ERG_ROW_STARTED
+                    ),
+                    "column_id": field,
+                },
+                "backgroundColor": "#fdecea",
+                "border": "1px solid #f5c2c7",
+            }
+        )
+
+    return styles
 
 
-def chunked(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
+def erg_row_label(record, index):
+    """Name a row the way the practitioner sees it in the table."""
+    row_no = record.get("row_no")
+    if row_no in (None, ""):
+        return f"table row {index + 1}"
+    return f"row {row_no} (table row {index + 1})"
 
 
-# END ONE-OFF BATCH-UPLOAD HELPERS
+def erg_wide_column_metric(column_name):
+    simplified = simplify_header(column_name)
+    match = re.search(r"(2000|6000)merg(.+)", simplified)
+    if not match:
+        return None, None
+
+    distance = int(match.group(1))
+    suffix = re.sub(r"\d+$", "", match.group(2).strip())
+    if suffix.startswith("avg"):
+        suffix = suffix[3:]
+    if suffix.startswith("average"):
+        suffix = suffix[7:]
+
+    if any(token in suffix for token in ["strokerate", "rate", "spm"]) or suffix == "sr":
+        return distance, "stroke_rate_spm"
+    if any(token in suffix for token in ["power", "watt"]) or suffix in {"a", "avg", "average", "p", "watts"}:
+        return distance, "power_w"
+    if suffix in {"r", "m", "min", "mins", "minute", "minutes"}:
+        return distance, "time_min"
+    if suffix in {"s", "sec", "secs", "second", "seconds"}:
+        return distance, "time_s"
+    if any(token in suffix for token in ["time", "score", "result"]) or suffix == "t":
+        return distance, "time"
+    if any(token in suffix for token in ["seconds", "second", "sec"]) or suffix == "times":
+        return distance, "time_s"
+    if "split" in suffix or suffix == "split":
+        return distance, "split_sec_per_500"
+
+    return distance, None
+
+
+def detect_erg_wide_columns(columns):
+    wide = {}
+    for column in columns:
+        distance, metric = erg_wide_column_metric(column)
+        if distance is None or metric is None:
+            continue
+        wide.setdefault(distance, {})
+        wide[distance].setdefault(metric, column)
+    return wide
+
+
+def build_erg_upload_row(profile_id, test_date, distance, values):
+    time_min, time_s = normalize_erg_time_parts(
+        time_min=values.get("time_min"),
+        time_s=values.get("time_s"),
+        time_value=values.get("time"),
+        split_sec_per_500=values.get("split_sec_per_500"),
+        distance=distance,
+    )
+
+    stroke_rate = pd.to_numeric(values.get("stroke_rate_spm"), errors="coerce")
+    power = pd.to_numeric(values.get("power_w"), errors="coerce")
+
+    return {
+        "row_no": None,
+        "profile_id": profile_id or "",
+        "test_date": test_date or "",
+        "distance_m": distance,
+        "stroke_rate_spm": float(stroke_rate) if pd.notna(stroke_rate) else "NA",
+        "power_w": float(power) if pd.notna(power) else "NA",
+        "time_min": time_min,
+        "time_s": time_s,
+    }
+
+
+def parse_wide_erg_upload(df, by_name):
+    wide_columns = detect_erg_wide_columns(df.columns)
+    if not wide_columns:
+        return None
+
+    rows = []
+    unresolved_names = []
+
+    rename_map = canonical_erg_upload_columns(df.columns)
+    df = df.rename(columns=rename_map)
+    if "profile_id" not in df.columns and "athlete" not in df.columns:
+        raise ValueError("CSV must include either profile_id or Name/Athlete.")
+
+    for _, raw in df.iterrows():
+        profile_id = resolve_uploaded_profile_id(raw, by_name, unresolved_names)
+        if not profile_id:
+            continue
+        test_date = parse_upload_date(raw.get("test_date"))
+
+        for distance, metric_columns in sorted(wide_columns.items()):
+            values = {
+                metric: raw.get(column)
+                for metric, column in metric_columns.items()
+            }
+            if all(clean_value(value) is None for value in values.values()):
+                continue
+            rows.append(build_erg_upload_row(profile_id, test_date, distance, values))
+
+    return finalize_erg_upload_rows(rows, unresolved_names)
+
+
+def parse_erg_upload(contents, filename, athlete_options):
+    if not contents:
+        raise ValueError("No file content provided.")
+    if not filename or not filename.lower().endswith(".csv"):
+        raise ValueError("Only CSV uploads are supported.")
+
+    _, encoded = contents.split(",", 1)
+    decoded = base64.b64decode(encoded)
+    df = pd.read_csv(io.StringIO(decoded.decode("utf-8-sig")))
+    df = df.dropna(how="all")
+    if df.empty:
+        raise ValueError("The uploaded CSV has no data rows.")
+
+    rename_map = canonical_erg_upload_columns(df.columns)
+    df = df.rename(columns=rename_map)
+
+    by_name, _ = athlete_lookup_from_options(athlete_options)
+    wide_result = parse_wide_erg_upload(df, by_name)
+    if wide_result is not None:
+        rows, incomplete, skipped_names = wide_result
+        if not rows:
+            if skipped_names:
+                raise ValueError(
+                    "No matched athletes were found. Skipped unmatched names: "
+                    + ", ".join(skipped_names)
+                )
+            raise ValueError("No 2000m or 6000m erg results were found in the uploaded CSV.")
+        return rows, incomplete, skipped_names
+
+    if "profile_id" not in df.columns and "athlete" not in df.columns:
+        raise ValueError("CSV must include either profile_id or Athlete/Name.")
+
+    rows = []
+    unresolved_names = []
+
+    for idx, raw in df.iterrows():
+        profile_id = resolve_uploaded_profile_id(raw, by_name, unresolved_names)
+        if not profile_id:
+            continue
+
+        row_no = pd.to_numeric(raw.get("row_no"), errors="coerce")
+        distance = pd.to_numeric(raw.get("distance_m"), errors="coerce")
+        stroke_rate = pd.to_numeric(raw.get("stroke_rate_spm"), errors="coerce")
+        power = pd.to_numeric(raw.get("power_w"), errors="coerce")
+        time_min, time_s = normalize_erg_time_parts(
+            time_min=raw.get("time_min"),
+            time_s=raw.get("time_s"),
+            time_value=raw.get("time"),
+            distance=distance if pd.notna(distance) else None,
+        )
+
+        rows.append(
+            {
+                "row_no": int(row_no) if pd.notna(row_no) else len(rows) + 1,
+                "profile_id": profile_id or "",
+                "test_date": parse_upload_date(raw.get("test_date")) or "",
+                "distance_m": int(distance) if pd.notna(distance) else None,
+                "stroke_rate_spm": float(stroke_rate) if pd.notna(stroke_rate) else "NA",
+                "power_w": float(power) if pd.notna(power) else "NA",
+                "time_min": time_min,
+                "time_s": time_s,
+            }
+        )
+
+    if not rows and unresolved_names:
+        raise ValueError(
+            "No matched athletes were found. Skipped unmatched names: "
+            + ", ".join(sorted(set(unresolved_names)))
+        )
+
+    return finalize_erg_upload_rows(rows, unresolved_names)
 
 
 def estimate_split_seconds(power_w):
@@ -560,56 +909,507 @@ def _interp_y_at_x(df, x_col, y_col, x_target):
 
 
 # =========================================================
+# BULK STEP TEST UPLOAD
+# =========================================================
+def athlete_labels_from_options(options):
+    """profile_id -> display name, for naming sessions back to the uploader."""
+    labels = {}
+    for option in options or []:
+        try:
+            labels[int(option.get("value"))] = str(option.get("label", "")).strip()
+        except (TypeError, ValueError):
+            continue
+    return labels
+
+
+def resolve_bulk_profile_id(raw, by_name):
+    """Return (profile_id, unmatched_text).
+
+    An explicit profile_id wins over the name, so a practitioner whose sheet
+    spells an athlete differently from the warehouse has a way through that
+    does not involve editing this file.
+    """
+    profile_id = clean_value(raw.get("profile_id"))
+    if profile_id is not None:
+        text = str(profile_id).strip()
+        if text.endswith(".0"):
+            text = text[:-2]
+        try:
+            return int(text), None
+        except ValueError:
+            return None, text
+
+    athlete = clean_value(raw.get("athlete"))
+    if athlete is None:
+        return None, None
+
+    for key in uploaded_name_lookup_keys(athlete):
+        match = by_name.get(key)
+        if match is not None:
+            try:
+                return int(match), None
+            except (TypeError, ValueError):
+                return None, str(athlete)
+
+    return None, str(athlete)
+
+
+def normalize_step_mode(value):
+    """'SUB-MAX', 'sub max', 'Submax' -> 'Submax'.
+
+    Returns (value, understood). Blank is understood and means "not stated",
+    which the schema allows; an unrecognised word is not, so the caller can
+    name it rather than quietly dropping it.
+    """
+    value = clean_value(value)
+    if value is None:
+        return None, True
+
+    key = re.sub(r"[^a-z]", "", str(value).lower())
+    if key in STEP_MODE_VALUES:
+        return STEP_MODE_VALUES[key], True
+    return None, False
+
+
+def parse_bulk_number(value):
+    """Returns (number_or_None, understood). Blank is understood as None."""
+    value = clean_value(value)
+    if value is None:
+        return None, True
+
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number):
+        return None, False
+    return float(number), True
+
+
+def read_uploaded_csv(contents, filename):
+    """Decode a dcc.Upload payload into a DataFrame."""
+    if not contents:
+        raise ValueError("No file content provided.")
+    if not filename or not filename.lower().endswith(".csv"):
+        raise ValueError("Only CSV uploads are supported.")
+
+    _, encoded = contents.split(",", 1)
+    decoded = base64.b64decode(encoded)
+    return pd.read_csv(io.StringIO(decoded.decode("utf-8-sig")))
+
+
+def parse_step_bulk_rows(df, athlete_options):
+    """Read every row of a bulk step-test sheet.
+
+    Returns (rows, problems). Every problem in the file is collected and
+    reported together, keyed to the spreadsheet line number: a practitioner
+    fixing a sheet wants one list to work through, not one error per upload.
+    """
+    by_name, _ = athlete_lookup_from_options(athlete_options)
+    rows = []
+    problems = []
+    unresolved = {}
+
+    for raw in df.to_dict("records"):
+        line = raw.get("_csv_line")
+
+        profile_id, unmatched = resolve_bulk_profile_id(raw, by_name)
+        if unmatched is not None:
+            unresolved.setdefault(unmatched, []).append(line)
+            continue
+        if profile_id is None:
+            problems.append(
+                f"line {line}: no athlete — fill in the athlete or profile_id column"
+            )
+            continue
+
+        test_date = parse_upload_date(raw.get("test_date"))
+        if test_date is None:
+            problems.append(
+                f"line {line}: could not read the test date "
+                f"{clean_value(raw.get('test_date'))!r} — use YYYY-MM-DD"
+            )
+            continue
+
+        step_no, understood = parse_bulk_number(raw.get("step_no"))
+        if not understood or step_no is None or step_no != int(step_no):
+            problems.append(
+                f"line {line}: step_no {clean_value(raw.get('step_no'))!r} "
+                "must be a whole number"
+            )
+            continue
+
+        mode, understood = normalize_step_mode(raw.get("mode"))
+        if not understood:
+            problems.append(
+                f"line {line}: mode {clean_value(raw.get('mode'))!r} is not "
+                "recognised — use Max or Submax"
+            )
+            continue
+
+        step_type, understood = normalize_step_mode(raw.get("step_type"))
+        if not understood:
+            problems.append(
+                f"line {line}: step_type {clean_value(raw.get('step_type'))!r} is "
+                "not recognised — use Max or Submax"
+            )
+            continue
+
+        raw_test_type = clean_value(raw.get("test_type"))
+        test_type = map_test_type(raw_test_type)
+        if raw_test_type is not None and test_type is None:
+            problems.append(
+                f"line {line}: test_type {raw_test_type!r} is not recognised — use "
+                "one of " + ", ".join(STEP_TEST_TYPE_VALUES)
+            )
+            continue
+
+        numbers = {}
+        bad_number = False
+        for field, label in STEP_NUMERIC_FIELDS.items():
+            number, understood = parse_bulk_number(raw.get(field))
+            if not understood:
+                problems.append(
+                    f"line {line}: {label} {clean_value(raw.get(field))!r} is not a number"
+                )
+                bad_number = True
+                continue
+            numbers[field] = number
+        if bad_number:
+            continue
+
+        raw_rpe = clean_value(raw.get("rpe"))
+        rpe = parse_rpe(raw_rpe)
+        if raw_rpe is not None and rpe is None:
+            problems.append(f"line {line}: rpe {raw_rpe!r} is not a number")
+            continue
+
+        rows.append(
+            {
+                "profile_id": profile_id,
+                "test_date": test_date,
+                "test_type": test_type,
+                # The schema wants a string here, never null.
+                "notes": clean_value(raw.get("notes")) or "",
+                "mode": mode,
+                # An unstated step type follows the test's mode, which is how
+                # the single-athlete form fills the column too.
+                "step_type": step_type or mode,
+                "step_no": int(step_no),
+                "rpe": rpe,
+                **numbers,
+            }
+        )
+
+    if unresolved:
+        details = []
+        for name, lines in sorted(unresolved.items()):
+            shown = ", ".join(str(line) for line in lines[:5])
+            if len(lines) > 5:
+                shown += f", …{len(lines) - 5} more"
+            details.append(f"{name!r} (line{'s' if len(lines) > 1 else ''} {shown})")
+        problems.append(
+            "could not match these athlete name(s) to a profile: "
+            + "; ".join(details)
+            + " — check the spelling against the athlete dropdown on the Step Test "
+            "tab, or put the warehouse profile_id in the profile_id column"
+        )
+
+    return rows, problems
+
+
+def build_step_bulk_records(rows, athlete_options):
+    """Group parsed rows into test sessions and render warehouse records.
+
+    session_id/session_ts are derived from the athlete and the test date rather
+    than from the clock, so re-uploading a corrected sheet lands on the same
+    session identity instead of minting a second copy of the test.
+    """
+    labels = athlete_labels_from_options(athlete_options)
+
+    sessions = {}
+    for row in rows:
+        key = (row["profile_id"], row["test_date"], row["test_type"], row["notes"])
+        sessions.setdefault(key, []).append(row)
+
+    ordered = sorted(
+        sessions.items(),
+        key=lambda item: (item[0][1], item[0][0], str(item[0][2]), item[0][3]),
+    )
+
+    records = []
+    preview = []
+    seen_per_athlete_day = {}
+
+    for (profile_id, test_date, test_type, notes), session_rows in ordered:
+        day = datetime.strptime(test_date, "%Y-%m-%d")
+        day_key = (profile_id, test_date)
+        index = seen_per_athlete_day.get(day_key, 0) + 1
+        seen_per_athlete_day[day_key] = index
+
+        session_id = f"{profile_id}_{day.strftime('%Y%m%d')}_{index:03d}"
+        session_ts = day.replace(hour=12).isoformat(timespec="seconds")
+
+        # One body mass per test: a sheet that records it on the first step row
+        # only still gets it onto every step of that session.
+        body_mass = next(
+            (row["body_mass_kg"] for row in session_rows if row["body_mass_kg"] is not None),
+            None,
+        )
+
+        session_rows = sorted(session_rows, key=lambda row: row["step_no"])
+        for row in session_rows:
+            records.append(
+                {
+                    "profile_id": profile_id,
+                    "session_id": session_id,
+                    "session_ts": session_ts,
+                    "test_date": test_date,
+                    "body_mass_kg": body_mass,
+                    "test_type": test_type,
+                    "mode": row["mode"],
+                    "notes": notes,
+                    "step_no": row["step_no"],
+                    "step_type": row["step_type"],
+                    "target_po_w": row["target_power_w"],
+                    "actual_po_w": row["actual_power_w"],
+                    "hr_bpm": row["heart_rate_bpm"],
+                    "lactate_mmol": row["lactate_mmol"],
+                    "vo2": row["vo2"],
+                    "rate_spm": row["stroke_rate_spm"],
+                    # Derived exactly as the single-athlete form derives it, so
+                    # bulk and manual entry produce identical records.
+                    "split_sec_per_500": estimate_split_seconds(row["actual_power_w"]),
+                    "rpe": row["rpe"],
+                    "time_s": row["time_s"],
+                }
+            )
+
+        modes = sorted({row["step_type"] for row in session_rows if row["step_type"]})
+        preview.append(
+            {
+                "athlete": labels.get(profile_id, f"profile {profile_id}"),
+                "profile_id": profile_id,
+                "test_date": test_date,
+                "test_type": test_type or "—",
+                "mode": "/".join(modes) if modes else "—",
+                "steps": len(session_rows),
+                "body_mass_kg": body_mass,
+                "session_id": session_id,
+            }
+        )
+
+    return records, preview
+
+
+def parse_step_bulk_upload(contents, filename, athlete_options):
+    """Parse a bulk step-test CSV into (records, preview, problems).
+
+    Nothing is returned for pushing while any problem stands: a half-ingested
+    sheet is far harder to unpick than a rejected one.
+    """
+    df = read_uploaded_csv(contents, filename)
+    df = df.rename(columns=canonical_columns(df.columns, STEP_UPLOAD_COLUMN_ALIASES))
+
+    # Carried alongside the data so every problem can name a line the
+    # practitioner can actually find in their spreadsheet (the header is 1).
+    data_columns = list(df.columns)
+    df["_csv_line"] = range(2, len(df) + 2)
+    df = df.dropna(how="all", subset=data_columns)
+    if df.empty:
+        raise ValueError("The uploaded CSV has no data rows.")
+
+    if "profile_id" not in data_columns and "athlete" not in data_columns:
+        raise ValueError(
+            "CSV must include an 'athlete' column (or 'profile_id'). "
+            "Download the template for the expected layout."
+        )
+
+    missing = [c for c in STEP_UPLOAD_REQUIRED_COLUMNS if c not in data_columns]
+    if missing:
+        raise ValueError(
+            "CSV is missing required column(s): "
+            + ", ".join(missing)
+            + ". Download the template for the expected layout."
+        )
+
+    rows, problems = parse_step_bulk_rows(df, athlete_options)
+    if problems:
+        return [], [], problems
+    if not rows:
+        raise ValueError("No usable rows were found in the uploaded CSV.")
+
+    records, preview = build_step_bulk_records(rows, athlete_options)
+    return records, preview, []
+
+
+def accepted_columns_help(alias_map, template_columns, required=(), either_of=()):
+    """Render the accepted header names straight from the alias table.
+
+    Generated rather than written out, so the help can never describe a format
+    the parser stopped accepting.
+    """
+    header_rows = []
+    for target in template_columns:
+        aliases = alias_map.get(target, set())
+        extras = sorted(alias for alias in aliases if alias != simplify_header(target))
+
+        if target in required:
+            need, colour = "required", "danger"
+        elif target in either_of:
+            need, colour = "one of these", "warning"
+        else:
+            need, colour = "optional", "secondary"
+
+        header_rows.append(
+            html.Tr(
+                [
+                    html.Td(html.Code(target)),
+                    html.Td(dbc.Badge(need, color=colour, pill=True)),
+                    html.Td(", ".join(extras) or "—", className="text-muted small"),
+                ]
+            )
+        )
+
+    return dbc.Accordion(
+        [
+            dbc.AccordionItem(
+                [
+                    html.P(
+                        "Case, spaces, underscores and punctuation are ignored when "
+                        "matching headers, so \"Heart Rate\" and \"heart_rate_bpm\" are "
+                        "the same column. Extra columns we do not recognise are ignored.",
+                        className="text-muted small",
+                    ),
+                    dbc.Table(
+                        [
+                            html.Thead(
+                                html.Tr(
+                                    [
+                                        html.Th("Column"),
+                                        html.Th(""),
+                                        html.Th("Also accepted"),
+                                    ]
+                                )
+                            ),
+                            html.Tbody(header_rows),
+                        ],
+                        size="sm",
+                        borderless=True,
+                        striped=True,
+                        className="mb-0",
+                    ),
+                ],
+                title="Accepted column names",
+            )
+        ],
+        start_collapsed=True,
+        className="mb-3",
+    )
+
+
+def upload_dropzone(component_id, prompt):
+    return dcc.Upload(
+        id=component_id,
+        children=html.Div(prompt),
+        style={
+            "width": "100%",
+            "height": "72px",
+            "lineHeight": "72px",
+            "borderWidth": "1px",
+            "borderStyle": "dashed",
+            "borderRadius": "5px",
+            "textAlign": "center",
+            "marginBottom": "8px",
+        },
+        accept=".csv",
+        multiple=False,
+    )
+
+
+def problem_list(filename, problems, limit=40):
+    """Show every problem at once, capped so one broken column cannot bury the page."""
+    shown = problems[:limit]
+    body = [
+        html.B(
+            f"{filename} was not loaded — fix {len(problems)} issue"
+            f"{'s' if len(problems) != 1 else ''} and upload again:"
+        ),
+        html.Ul([html.Li(problem) for problem in shown], className="mb-0 mt-2"),
+    ]
+    if len(problems) > limit:
+        body.append(
+            html.Small(f"…and {len(problems) - limit} more.", className="text-muted")
+        )
+    return html.Div(body)
+
+
+# =========================================================
 # LAYOUT
 # =========================================================
 
-# Toggle whether the one-off batch upload UI is shown.
-# The batch upload logic remains available if you want to call it programmatically.
-BATCH_UPLOAD_UI = (
-    [
-        html.H5("One-off Batch CSV Upload", className="mt-3"),
-        dcc.Upload(
-            id="batch-upload",
-            children=html.Div(
-                [
-                    "Drag and drop a CSV file here, or click to select.",
-                ]
-            ),
-            style={
-                "width": "100%",
-                "height": "80px",
-                "lineHeight": "80px",
-                "borderWidth": "1px",
-                "borderStyle": "dashed",
-                "borderRadius": "5px",
-                "textAlign": "center",
-                "marginBottom": "8px",
-            },
-            accept=".csv",
-            multiple=False,
-        ),
-        dbc.Button(
-            "Upload CSV to Warehouse",
-            id="batch-upload-submit",
-            color="secondary",
-            className="w-100 mb-2",
-        ),
-        dbc.Alert(id="batch-upload-status", color="info", is_open=False),
-        html.Small(
-            "(Remove this batch-upload section after you’ve completed the one-off import)",
-            className="text-muted",
-        ),
-    ]
-    if ENABLE_BATCH_UPLOAD_UI
-    else []
-)
-
 layout = dbc.Container(
     [
-        html.H2("Entry"),
-        html.Div("Step test workflow and batch erg entry."),
-        html.Hr(),
+        dbc.Row(
+            dbc.Col(
+                [
+                    html.Div("PHYSIOLOGY", className="page-eyebrow"),
+                    html.H1("Data Entry", className="mb-1"),
+                    html.P(
+                        "Step test workflow and batch erg entry.",
+                        className="text-muted mb-0",
+                    ),
+                ]
+            ),
+            className="page-title-header align-items-center mt-4 mb-4",
+        ),
         dcc.Store(id="athlete-options-store"),
+        dcc.Store(id="form-last-submitted-fingerprint"),
+
+        # Table rows are mirrored here on every edit and restored on load.
+        # DataTable's own `persistence` only re-applies a saved edit while the
+        # layout's `data` still matches what was there when the edit was first
+        # recorded — and three callbacks rewrite this table's `data`, so that
+        # match is not something to depend on. An explicit store always wins.
+        dcc.Store(id="step-table-draft", storage_type=PERSISTENCE_TYPE),
+        dcc.Store(id="erg-table-draft", storage_type=PERSISTENCE_TYPE),
+        dcc.Interval(id="entry-page-load", interval=250, n_intervals=0, max_intervals=1),
+
+        dcc.Interval(
+            id="auth-keepalive-interval",
+            interval=AUTH_KEEPALIVE_INTERVAL_MS,
+            n_intervals=0,
+        ),
+
+        # Reset clears a whole test, so it asks first.
+        dcc.ConfirmDialog(
+            id="form-reset-confirm",
+            message=(
+                "Clear the step test form?\n\n"
+                "This removes the selected athlete, the test details, the notes "
+                "and every step row. It cannot be undone."
+            ),
+        ),
+
+        # Status messages are pinned to the viewport instead of sitting at the
+        # bottom of a narrow column, where an expired session or a failed
+        # submit could go unseen while the practitioner works in the table.
+        html.Div(
+            [
+                dbc.Alert(
+                    id="form-auth-status-msg",
+                    color="warning",
+                    is_open=False,
+                    dismissable=True,
+                    className="shadow",
+                ),
+                dbc.Alert(
+                    id="form-status-msg",
+                    color="success",
+                    is_open=False,
+                    dismissable=True,
+                    className="shadow",
+                ),
+            ],
+            className="entry-status-stack",
+        ),
 
         dbc.Tabs(
             [
@@ -637,6 +1437,8 @@ layout = dbc.Container(
                                                                 options=[],
                                                                 placeholder="Select athlete",
                                                                 value=None,
+                                                                persistence=True,
+                                                                persistence_type=PERSISTENCE_TYPE,
                                                             ),
                                                         ],
                                                         md=6,
@@ -650,6 +1452,8 @@ layout = dbc.Container(
                                                                 min=0,
                                                                 step=0.1,
                                                                 value=None,
+                                                                persistence=True,
+                                                                persistence_type=PERSISTENCE_TYPE,
                                                             ),
                                                         ],
                                                         md=6,
@@ -663,6 +1467,8 @@ layout = dbc.Container(
                                                                 display_format="YYYY-MM-DD",
                                                                 first_day_of_week=1,
                                                                 clearable=False,
+                                                                persistence=True,
+                                                                persistence_type=PERSISTENCE_TYPE,
                                                             ),
                                                         ],
                                                         md=6,
@@ -678,6 +1484,8 @@ layout = dbc.Container(
                                                                 step=1,
                                                                 placeholder="optional",
                                                                 value=None,
+                                                                persistence=True,
+                                                                persistence_type=PERSISTENCE_TYPE,
                                                             ),
                                                         ],
                                                         md=6,
@@ -700,8 +1508,10 @@ layout = dbc.Container(
                                                                     {"label": "Bike", "value": "bike"},
                                                                     {"label": "Other", "value": "other"},
                                                                 ],
-                                                                value="erg_C2",
+                                                                value=DEFAULT_TEST_TYPE,
                                                                 inline=True,
+                                                                persistence=True,
+                                                                persistence_type=PERSISTENCE_TYPE,
                                                             ),
                                                         ],
                                                         md=12,
@@ -715,8 +1525,10 @@ layout = dbc.Container(
                                                                     {"label": "Max", "value": "Max"},
                                                                     {"label": "Submax", "value": "Submax"},
                                                                 ],
-                                                                value="Submax",
+                                                                value=DEFAULT_MODE,
                                                                 inline=True,
+                                                                persistence=True,
+                                                                persistence_type=PERSISTENCE_TYPE,
                                                             ),
                                                         ],
                                                         md=12,
@@ -731,6 +1543,8 @@ layout = dbc.Container(
                                                 placeholder="Anything you want to capture...",
                                                 value="",
                                                 style={"height": "110px"},
+                                                persistence=True,
+                                                persistence_type=PERSISTENCE_TYPE,
                                             ),
                                             html.Br(),
                                             dbc.Row(
@@ -751,10 +1565,6 @@ layout = dbc.Container(
                                                 className="g-2",
                                             ),
                                             dcc.Download(id="form-download-csv"),
-
-                                            *BATCH_UPLOAD_UI,
-                                            html.Hr(),
-                                            dbc.Alert(id="form-status-msg", color="success", is_open=False),
                                         ],
                                     ),
                                     md=4,
@@ -773,7 +1583,7 @@ layout = dbc.Container(
                                             ),
                                             dash_table.DataTable(
                                                 id="form-items-table",
-                                                data=DEFAULT_ROWS,
+                                                data=blank_step_rows(),
                                                 columns=TABLE_COLUMNS,
                                                 editable=True,
                                                 row_selectable="multi",
@@ -863,19 +1673,140 @@ layout = dbc.Container(
                         make_card(
                             "Batch Erg Entry",
                             [
+                                dbc.Row(
+                                    [
+                                        dbc.Col(
+                                            dcc.Upload(
+                                                id="erg-upload",
+                                                children=html.Div("Drag and drop an erg CSV here, or click to select."),
+                                                style={
+                                                    "width": "100%",
+                                                    "height": "72px",
+                                                    "lineHeight": "72px",
+                                                    "borderWidth": "1px",
+                                                    "borderStyle": "dashed",
+                                                    "borderRadius": "5px",
+                                                    "textAlign": "center",
+                                                    "marginBottom": "8px",
+                                                },
+                                                accept=".csv",
+                                                multiple=False,
+                                            ),
+                                            md=8,
+                                        ),
+                                        dbc.Col(
+                                            [
+                                                dbc.Button(
+                                                    "Download CSV Template",
+                                                    id="erg-template-btn",
+                                                    color="secondary",
+                                                    outline=True,
+                                                    size="sm",
+                                                    className="mb-2 w-100",
+                                                ),
+                                                html.Small(
+                                                    "Upload fills the table for review; use Push to Warehouse after checking rows.",
+                                                    className="text-muted",
+                                                ),
+                                            ],
+                                            md=4,
+                                        ),
+                                    ],
+                                    className="g-2 mb-2",
+                                ),
+                                dcc.Download(id="erg-template-csv"),
+                                dbc.Alert(id="erg-upload-status", color="info", is_open=False, className="mb-3"),
+                                accepted_columns_help(
+                                    ERG_UPLOAD_COLUMN_ALIASES,
+                                    ERG_TEMPLATE_COLUMNS,
+                                    required=("test_date", "distance_m"),
+                                    either_of=("athlete", "profile_id"),
+                                ),
+                                html.Small(
+                                    "Times are whole minutes plus the leftover seconds — a 7:12.4 2k is "
+                                    "time_min 7, time_s 12.4. A single \"time\" column written as 7:12.4 "
+                                    "works instead. A wide sheet works too: columns named like "
+                                    "\"2000m Erg Power\" or \"6000m Erg Rate\" are split into one row per "
+                                    "distance automatically.",
+                                    className="text-muted d-block mb-3",
+                                ),
+                                # One toolbar instead of two stacked rows: the date
+                                # control and the row actions act on the same table,
+                                # so they belong on the same line, with the
+                                # irreversible action (Push) held apart on the right.
                                 html.Div(
                                     [
-                                        dbc.Button("Add row", id="erg-add-row", color="success", size="sm", className="me-2"),
-                                        dbc.Button("Delete selected", id="erg-delete-rows", color="danger", size="sm", outline=True),
-                                        dbc.Button("Download CSV", id="erg-download-btn", color="info", size="sm", outline=True, className="ms-2"),
+                                        html.Div(
+                                            [
+                                                dbc.Label(
+                                                    "Test date",
+                                                    html_for="erg-date-picker",
+                                                    className="erg-toolbar-label",
+                                                ),
+                                                html.Div(
+                                                    [
+                                                        dcc.DatePickerSingle(
+                                                            id="erg-date-picker",
+                                                            date=date.today().isoformat(),
+                                                            display_format="YYYY-MM-DD",
+                                                            first_day_of_week=1,
+                                                            clearable=False,
+                                                            persistence=True,
+                                                            persistence_type=PERSISTENCE_TYPE,
+                                                        ),
+                                                        dbc.Button(
+                                                            "Apply",
+                                                            id="erg-apply-date",
+                                                            color="secondary",
+                                                            outline=True,
+                                                            size="sm",
+                                                        ),
+                                                    ],
+                                                    className="erg-toolbar-group",
+                                                ),
+                                            ],
+                                            className="erg-toolbar-field",
+                                        ),
+                                        html.Div(
+                                            [
+                                                dbc.Label("Rows", className="erg-toolbar-label"),
+                                                html.Div(
+                                                    [
+                                                        dbc.Button("Add row", id="erg-add-row", color="success", size="sm"),
+                                                        dbc.Button("Delete selected", id="erg-delete-rows", color="danger", size="sm", outline=True),
+                                                    ],
+                                                    className="erg-toolbar-group",
+                                                ),
+                                            ],
+                                            className="erg-toolbar-field",
+                                        ),
+                                        html.Div(
+                                            [
+                                                dbc.Label("Save", className="erg-toolbar-label"),
+                                                html.Div(
+                                                    [
+                                                        dbc.Button("Download CSV", id="erg-download-btn", color="info", size="sm", outline=True),
+                                                        dbc.Button("Push to Warehouse", id="erg-submit", color="primary", size="sm"),
+                                                    ],
+                                                    className="erg-toolbar-group",
+                                                ),
+                                            ],
+                                            className="erg-toolbar-field ms-auto",
+                                        ),
                                     ],
-                                    className="mb-2",
+                                    className="erg-toolbar erg-date-controls mb-2",
+                                ),
+                                html.Small(
+                                    "Apply and Delete act on the selected rows \u2014 with nothing "
+                                    "selected, Apply sets the date on every row. Cells tinted red are "
+                                    "required before that row can be pushed; fully blank rows are ignored.",
+                                    className="text-muted d-block mb-3",
                                 ),
 
                                 html.Div(
                                     dash_table.DataTable(
                                         id="erg-items-table",
-                                        data=ERG_DEFAULT_ROWS,
+                                        data=blank_erg_rows(),
                                         columns=ERG_TABLE_COLUMNS,
                                         dropdown={
                                             "profile_id": {
@@ -899,7 +1830,7 @@ layout = dbc.Container(
                                             "overflowX": "auto",
                                             "overflowY": "visible",
                                             "position": "relative",
-                                            "zIndex": 10,
+                                            "zIndex": 2,
                                         },
                                         style_cell={
                                             "padding": "6px 10px",
@@ -919,26 +1850,72 @@ layout = dbc.Container(
                                             "backgroundColor": "white",
                                             "border": "1px solid #dee2e6",
                                         },
-                                        style_cell_conditional=[
-                                            {"if": {"column_id": "row_no"}, "width": "70px"},
-                                            {"if": {"column_id": "profile_id"}, "width": "260px", "textAlign": "left"},
-                                            {"if": {"column_id": "distance_m"}, "width": "140px"},
-                                            {"if": {"column_id": "stroke_rate_spm"}, "width": "150px"},
-                                            {"if": {"column_id": "power_w"}, "width": "130px"},
-                                            {"if": {"column_id": "time_s"}, "width": "130px"},
+                                        style_data_conditional=[
+                                            {
+                                                "if": {"column_id": "profile_id"},
+                                                "backgroundColor": "#fbfdff",
+                                            },
+                                            {
+                                                "if": {"column_id": "distance_m"},
+                                                "backgroundColor": "#fbfdff",
+                                            },
+                                            {
+                                                "if": {"row_index": "odd"},
+                                                "backgroundColor": "#fcfcfd",
+                                            },
+                                            # Missing-value tints come last so they
+                                            # win over the banding and the dropdown
+                                            # column shading above.
+                                            *erg_missing_cell_styles(),
                                         ],
+                                        style_cell_conditional=[
+                                            {"if": {"column_id": "row_no"}, "width": "60px", "color": "#6c757d"},
+                                            {"if": {"column_id": "test_date"}, "width": "120px"},
+                                            {"if": {"column_id": "profile_id"}, "width": "280px", "minWidth": "240px", "textAlign": "left"},
+                                            {"if": {"column_id": "distance_m"}, "width": "120px"},
+                                            {"if": {"column_id": "stroke_rate_spm"}, "width": "120px"},
+                                            {"if": {"column_id": "power_w"}, "width": "110px"},
+                                            {"if": {"column_id": "time_min"}, "width": "110px"},
+                                            {"if": {"column_id": "time_s"}, "width": "110px"},
+                                        ],
+                                        tooltip_header={
+                                            "profile_id": "Required. Pick from the athlete list.",
+                                            "distance_m": "Required. 2000 or 6000.",
+                                            "time_min": "Whole minutes only \u2014 7:12.4 is 7 here.",
+                                            "time_s": "Leftover seconds \u2014 7:12.4 is 12.4 here.",
+                                        },
+                                        tooltip_delay=400,
+                                        tooltip_duration=None,
                                         css=[
                                             {
                                                 "selector": ".dash-spreadsheet-container .Select-menu-outer",
-                                                "rule": "display: block !important; z-index: 3000 !important; max-height: 260px;",
+                                                "rule": """
+                                                    display: block !important;
+                                                    z-index: 7000 !important;
+                                                    max-height: 320px !important;
+                                                    border: 1px solid #adb5bd !important;
+                                                    border-radius: 8px !important;
+                                                    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16) !important;
+                                                    overflow-y: auto !important;
+                                                """,
                                             },
                                             {
                                                 "selector": ".dash-spreadsheet-container .Select-option",
-                                                "rule": "color: #212529 !important; background-color: white !important; padding: 8px 10px !important;",
+                                                "rule": """
+                                                    color: #212529 !important;
+                                                    background-color: white !important;
+                                                    padding: 10px 12px !important;
+                                                    line-height: 1.25 !important;
+                                                    white-space: normal !important;
+                                                """,
                                             },
                                             {
                                                 "selector": ".dash-spreadsheet-container .Select-option.is-focused",
-                                                "rule": "background-color: #f8f9fa !important;",
+                                                "rule": "background-color: #eaf3ff !important;",
+                                            },
+                                            {
+                                                "selector": ".dash-spreadsheet-container .Select-option.is-selected",
+                                                "rule": "background-color: #d7ebff !important;",
                                             },
                                             {
                                                 "selector": ".dash-spreadsheet-container .Select-value-label",
@@ -966,6 +1943,7 @@ layout = dbc.Container(
                                                     max-width: 100% !important;
                                                     min-height: 38px !important;
                                                     height: 38px !important;
+                                                    cursor: pointer !important;
                                                 """,
                                             },
                                             {
@@ -993,12 +1971,14 @@ layout = dbc.Container(
                                                 "rule": """
                                                     height: 36px !important;
                                                     margin-left: 4px !important;
+                                                    padding-left: 0 !important;
                                                 """,
                                             },
                                             {
                                                 "selector": ".dash-spreadsheet-container .Select-arrow-zone",
                                                 "rule": """
                                                     padding-right: 6px !important;
+                                                    width: 26px !important;
                                                 """,
                                             },
                                             {
@@ -1008,16 +1988,21 @@ layout = dbc.Container(
                                                     box-shadow: inset 0 0 0 1px #86b7fe !important;
                                                 """,
                                             },
+                                            {
+                                                "selector": ".dash-spreadsheet-container .cell--selected",
+                                                "rule": "box-shadow: inset 0 0 0 2px #dc3545 !important;",
+                                            },
+                                            {
+                                                "selector": ".dash-spreadsheet-container td.focused",
+                                                "rule": "box-shadow: inset 0 0 0 2px #dc3545 !important;",
+                                            },
                                         ],
                                     ),
-                                    style={
-                                        "position": "relative",
-                                        "zIndex": 20,
-                                        "marginBottom": "1rem",
-                                    },
+                                    className="erg-table-wrap",
                                 ),
 
                                 dcc.Download(id="erg-download-csv"),
+                                dbc.Alert(id="erg-submit-status", color="success", is_open=False, className="mt-3"),
 
                                 dbc.Row(
                                     [
@@ -1031,7 +2016,111 @@ layout = dbc.Container(
                             ],
                         )
                     ],
-                )
+                ),
+                # =====================================================
+                # BULK STEP TEST UPLOAD TAB
+                # =====================================================
+                dbc.Tab(
+                    label="Bulk Step Upload",
+                    tab_id="tab-bulk-step",
+                    children=[
+                        make_card(
+                            "Bulk Step Test Upload",
+                            [
+                                dcc.Store(id="bulk-step-records"),
+                                dcc.Store(id="bulk-step-fingerprint"),
+                                dcc.Download(id="bulk-step-template-csv"),
+                                html.P(
+                                    "Upload one CSV holding many athletes' step tests. Use one row "
+                                    "per step, and repeat the athlete, date, body mass, test type, "
+                                    "mode and notes on every step row of that test. Rows are grouped "
+                                    "into sessions by athlete, date, test type and notes.",
+                                    className="text-muted",
+                                ),
+                                dbc.Row(
+                                    [
+                                        dbc.Col(
+                                            upload_dropzone(
+                                                "bulk-step-upload",
+                                                "Drag and drop a step test CSV here, or click to select.",
+                                            ),
+                                            md=8,
+                                        ),
+                                        dbc.Col(
+                                            [
+                                                dbc.Button(
+                                                    "Download CSV Template",
+                                                    id="bulk-step-template-btn",
+                                                    color="secondary",
+                                                    outline=True,
+                                                    size="sm",
+                                                    className="mb-2 w-100",
+                                                ),
+                                                html.Small(
+                                                    "Nothing is sent until you have read the preview "
+                                                    "and pressed Push.",
+                                                    className="text-muted",
+                                                ),
+                                            ],
+                                            md=4,
+                                        ),
+                                    ],
+                                    className="g-2 mb-2",
+                                ),
+                                dbc.Alert(
+                                    id="bulk-step-status",
+                                    color="info",
+                                    is_open=False,
+                                    className="mb-3",
+                                ),
+                                accepted_columns_help(
+                                    STEP_UPLOAD_COLUMN_ALIASES,
+                                    STEP_TEMPLATE_COLUMNS,
+                                    required=STEP_UPLOAD_REQUIRED_COLUMNS,
+                                    either_of=("athlete", "profile_id"),
+                                ),
+                                html.H6("Sessions found", className="mt-2"),
+                                dash_table.DataTable(
+                                    id="bulk-step-preview",
+                                    data=[],
+                                    columns=BULK_STEP_PREVIEW_COLUMNS,
+                                    editable=False,
+                                    page_action="native",
+                                    page_size=15,
+                                    sort_action="native",
+                                    style_table={"overflowX": "auto"},
+                                    style_cell={
+                                        "padding": "6px 10px",
+                                        "fontFamily": "system-ui",
+                                        "fontSize": 14,
+                                        "textAlign": "center",
+                                    },
+                                    style_cell_conditional=[
+                                        {"if": {"column_id": "athlete"}, "textAlign": "left", "minWidth": "200px"},
+                                        {"if": {"column_id": "session_id"}, "textAlign": "left"},
+                                    ],
+                                    style_header={
+                                        "fontWeight": "700",
+                                        "backgroundColor": "#f8f9fa",
+                                    },
+                                ),
+                                dbc.Button(
+                                    "Push to Warehouse",
+                                    id="bulk-step-submit",
+                                    color="primary",
+                                    disabled=True,
+                                    className="mt-3",
+                                ),
+                                dbc.Alert(
+                                    id="bulk-step-submit-status",
+                                    color="success",
+                                    is_open=False,
+                                    className="mt-3",
+                                ),
+                            ],
+                        )
+                    ],
+                ),
             ],
             id="entry-tabs",
             active_tab="tab-step-test",
@@ -1054,7 +2143,7 @@ def load_athlete_options(_):
     except Exception:
         raise PreventUpdate
 
-    filters = {"sport_org_id": 13}
+    filters = {"sport_org_id": SPORT_ORG_ID}
     names = fetch_profiles(token, filters)
 
     return [
@@ -1064,6 +2153,23 @@ def load_athlete_options(_):
         }
         for p in names
     ]
+
+
+@dash.callback(
+    Output("form-auth-status-msg", "children"),
+    Output("form-auth-status-msg", "color"),
+    Output("form-auth-status-msg", "is_open"),
+    Input("auth-keepalive-interval", "n_intervals"),
+)
+def keep_auth_session_alive(n_intervals):
+    try:
+        auth.get_token()
+    except Exception as e:
+        if is_auth_error(e):
+            return auth_relogin_message("submit"), "warning", True
+        return "Unable to refresh the login session. Submit may fail if the session has expired.", "warning", True
+
+    return "", "success", False
 
 
 @dash.callback(
@@ -1163,6 +2269,45 @@ def apply_mode_to_all_rows(mode, rows):
 
 
 @dash.callback(
+    Output("step-table-draft", "data"),
+    Input("form-items-table", "data"),
+    prevent_initial_call=True,
+)
+def save_step_draft(rows):
+    """Mirror every step-table edit into session storage."""
+    return rows
+
+
+@dash.callback(
+    Output("erg-table-draft", "data"),
+    Input("erg-items-table", "data"),
+    prevent_initial_call=True,
+)
+def save_erg_draft(rows):
+    return rows
+
+
+@dash.callback(
+    Output("form-items-table", "data", allow_duplicate=True),
+    Output("erg-items-table", "data", allow_duplicate=True),
+    Input("entry-page-load", "n_intervals"),
+    State("step-table-draft", "data"),
+    State("erg-table-draft", "data"),
+    prevent_initial_call=True,
+)
+def restore_table_drafts(_, step_draft, erg_draft):
+    """Put the tables back after a refresh, a navbar mis-click, or the
+    token-expiry redirect."""
+    step = step_draft if draft_is_restorable(step_draft) else no_update
+    erg = erg_draft if draft_is_restorable(erg_draft) else no_update
+
+    if step is no_update and erg is no_update:
+        raise PreventUpdate
+
+    return step, erg
+
+
+@dash.callback(
     Output("form-avg-PO", "children"),
     Output("form-avg-HR", "children"),
     Output("form-avg-rate", "children"),
@@ -1207,11 +2352,66 @@ def compute_split_column(_, rows):
 
 
 @dash.callback(
+    Output("form-reset-confirm", "displayed"),
+    Input("form-reset", "n_clicks"),
+    prevent_initial_call=True,
+)
+def ask_before_reset(reset_clicks):
+    """Reset now really clears the form, so make the practitioner confirm."""
+    if not reset_clicks:
+        raise PreventUpdate
+    return True
+
+
+@dash.callback(
+    Output("form-name", "value"),
+    Output("form-mass", "value"),
+    Output("form-test-date", "date"),
+    Output("form-max-hr", "value"),
+    Output("form-status", "value"),
+    Output("form-mode", "value"),
+    Output("form-notes", "value"),
+    Output("form-items-table", "data", allow_duplicate=True),
+    Output("form-items-table", "selected_rows", allow_duplicate=True),
+    Output("form-last-payload", "data", allow_duplicate=True),
+    Output("form-last-submitted-fingerprint", "data", allow_duplicate=True),
+    Output("form-status-msg", "children", allow_duplicate=True),
+    Output("form-status-msg", "color", allow_duplicate=True),
+    Output("form-status-msg", "is_open", allow_duplicate=True),
+    Input("form-reset-confirm", "submit_n_clicks"),
+    prevent_initial_call=True,
+)
+def reset_form(confirm_clicks):
+    """Actually clear every field. Previously this only wrote a store nobody
+    read, so the form stayed populated while reporting success."""
+    if not confirm_clicks:
+        raise PreventUpdate
+
+    return (
+        None,                       # athlete
+        None,                       # body mass
+        date.today().isoformat(),   # test date
+        None,                       # max HR
+        DEFAULT_TEST_TYPE,
+        DEFAULT_MODE,
+        "",                         # notes
+        blank_step_rows(),
+        [],
+        None,                       # last payload
+        None,                       # clear the duplicate-submit guard
+        "Form cleared.",
+        "info",
+        True,
+    )
+
+
+@dash.callback(
     Output("form-last-payload", "data"),
+    Output("form-last-submitted-fingerprint", "data"),
     Output("form-status-msg", "children"),
+    Output("form-status-msg", "color"),
     Output("form-status-msg", "is_open"),
     Input("form-submit", "n_clicks"),
-    Input("form-reset", "n_clicks"),
     State("form-name", "value"),
     State("form-mass", "value"),
     State("form-test-date", "date"),
@@ -1219,27 +2419,39 @@ def compute_split_column(_, rows):
     State("form-mode", "value"),
     State("form-notes", "value"),
     State("form-items-table", "data"),
+    State("form-last-submitted-fingerprint", "data"),
     prevent_initial_call=True,
+    # Disables the button and relabels it for the duration of the ingest, so a
+    # slow warehouse call cannot be clicked a second time.
+    running=[
+        (Output("form-submit", "disabled"), True, False),
+        (Output("form-submit", "children"), "Submitting…", "Submit"),
+        (Output("form-reset", "disabled"), True, False),
+    ],
 )
-def submit_or_reset(submit_clicks, reset_clicks, profile_id, mass, test_date, test_type, mode, notes, table_rows):
-    trig = ctx.triggered_id
-
-    if trig == "form-reset":
-        payload = {"timestamp": datetime.now().isoformat(timespec="seconds"), "reset": True}
-        return payload, "Form reset requested.", True
-
+def submit_form(
+    submit_clicks,
+    profile_id,
+    mass,
+    test_date,
+    test_type,
+    mode,
+    notes,
+    table_rows,
+    last_submission,
+):
     if not submit_clicks:
         raise PreventUpdate
 
     if profile_id is None:
-        return no_update, "Please select an athlete before submitting.", True
+        return no_update, no_update, "Please select an athlete before submitting.", "warning", True
 
     if test_date is None:
-        return no_update, "Please select a test date before submitting.", True
+        return no_update, no_update, "Please select a test date before submitting.", "warning", True
 
     table_rows = table_rows or []
     if not isinstance(table_rows, list) or len(table_rows) == 0:
-        return no_update, "No step data found. Add at least one row.", True
+        return no_update, no_update, "No step data found. Add at least one row.", "warning", True
 
     session_ts = datetime.now().isoformat(timespec="seconds")
     session_id = f"{int(profile_id)}_{session_ts}"
@@ -1273,7 +2485,25 @@ def submit_or_reset(submit_clicks, reset_clicks, profile_id, mass, test_date, te
         })
 
     if not records:
-        return no_update, "All rows were empty — nothing to submit.", True
+        return no_update, no_update, "All rows were empty — nothing to submit.", "warning", True
+
+    # Guard against pushing the identical test twice. Each click mints a new
+    # session_id, so without this nothing downstream could tell the copies apart.
+    fingerprint = submission_fingerprint(records)
+    last_submission = last_submission or {}
+    if last_submission.get("fingerprint") == fingerprint:
+        return (
+            no_update,
+            no_update,
+            (
+                f"This exact data was already submitted at "
+                f"{last_submission.get('submitted_at', 'an earlier time')} "
+                f"(dataset {last_submission.get('dataset_uuid', 'unknown')}). "
+                "Change a value, or press Reset, before submitting again."
+            ),
+            "warning",
+            True,
+        )
 
     payload = {
         "timestamp": session_ts,
@@ -1292,7 +2522,7 @@ def submit_or_reset(submit_clicks, reset_clicks, profile_id, mass, test_date, te
 
     try:
         if not VO2_STEP_SOURCE_UUID:
-            return payload, "Ingest failed: VO2_STEP_SOURCE_UUID is not set.", True
+            return payload, no_update, "Ingest failed: VO2_STEP_SOURCE_UUID is not set.", "danger", True
 
         dataset, created = wc.ingest_raw(
             source_uuid=VO2_STEP_SOURCE_UUID,
@@ -1300,78 +2530,27 @@ def submit_or_reset(submit_clicks, reset_clicks, profile_id, mass, test_date, te
             subject_field="profile_id",
             validate_client_side=False,
         )
-        return payload, f"Submitted {created} row(s). Dataset UUID: {dataset['uuid']}", True
+        submitted = {
+            "fingerprint": fingerprint,
+            "dataset_uuid": dataset["uuid"],
+            "submitted_at": session_ts,
+        }
+        return (
+            payload,
+            submitted,
+            f"Submitted {created} row(s). Dataset UUID: {dataset['uuid']}",
+            "success",
+            True,
+        )
 
     except WarehouseClientError as e:
-        return payload, f"Ingest failed: {e}", True
-
-
-# --------------------------------------------------
-# One-off batch CSV upload callback (remove after use)
-# --------------------------------------------------
-if ENABLE_BATCH_UPLOAD_UI:
-
-    @dash.callback(
-        Output("batch-upload-status", "children"),
-        Output("batch-upload-status", "color"),
-        Output("batch-upload-status", "is_open"),
-        Input("batch-upload-submit", "n_clicks"),
-        State("batch-upload", "contents"),
-        State("batch-upload", "filename"),
-        prevent_initial_call=True,
-    )
-    def batch_upload(n_clicks, contents, filename):
-        if not contents:
-            return "No file uploaded.", "warning", True
-
-        if not VO2_STEP_SOURCE_UUID:
-            return (
-                "Batch upload failed: VO2_STEP_SOURCE_UUID is not set. Set it in settings.py.",
-                "danger",
-                True,
-            )
-
-        try:
-            df = prepare_batch_dataframe(contents, filename)
-
-            if TEST_ONLY_ATHLETE:
-                df = df[df["About"].str.strip().str.lower() == TEST_ONLY_ATHLETE.strip().lower()]
-                if df.empty:
-                    return (
-                        f"No rows found for TEST_ONLY_ATHLETE='{TEST_ONLY_ATHLETE}'.", "warning", True
-                    )
-
-            token = auth.get_token()
-            profiles = fetch_profiles(token, {"sport_org_id": SPORT_ORG_ID})
-            by_name = {
-                f"{p['person']['first_name']} {p['person']['last_name']}".strip().lower(): int(p['id'])
-                for p in profiles
-                if p.get('person')
-            }
-
-            records, skipped = build_batch_records(df, by_name)
-            if BATCH_UPLOAD_DRY_RUN:
-                msg = f"Dry run: prepared {len(records)} records (no upload)."
-                if skipped:
-                    msg += f" Skipped {len(skipped)} athletes: {', '.join(skipped)}."
-                msg += " Change BATCH_UPLOAD_DRY_RUN to False to ingest."
-                return msg, "info", True
-
-            dataset, created = wc.ingest_raw(
-                source_uuid=VO2_STEP_SOURCE_UUID,
-                records=records,
-                subject_field="profile_id",
-                validate_client_side=False,
-            )
-
-            return (
-                f"Uploaded {created} records (dataset {dataset.get('uuid')}).",
-                "success",
-                True,
-            )
-
-        except Exception as e:
-            return f"Batch upload failed: {e}", "danger", True
+        if is_auth_error(e):
+            return payload, no_update, auth_relogin_message("submit again"), "warning", True
+        return payload, no_update, f"Ingest failed: {e}", "danger", True
+    except Exception as e:
+        if is_auth_error(e):
+            return payload, no_update, auth_relogin_message("submit again"), "warning", True
+        return payload, no_update, f"Ingest failed unexpectedly: {e}", "danger", True
 
 
 @dash.callback(
@@ -1470,7 +2649,7 @@ def update_plots(rows):
 @dash.callback(
     Output("zones-table", "data"),
     Input("form-items-table", "data"),
-    State("form-max-hr", "value"),
+    Input("form-max-hr", "value"),
 )
 def compute_zones(step_rows, max_hr_input):
     step_rows = step_rows or []
@@ -1645,35 +2824,81 @@ def download_zones_csv(n_clicks, rows):
 @dash.callback(
     Output("erg-items-table", "data"),
     Output("erg-items-table", "selected_rows"),
+    Output("erg-upload-status", "children"),
+    Output("erg-upload-status", "color"),
+    Output("erg-upload-status", "is_open"),
+    Input("erg-upload", "contents"),
     Input("erg-add-row", "n_clicks"),
     Input("erg-delete-rows", "n_clicks"),
+    Input("erg-apply-date", "n_clicks"),
     State("erg-items-table", "data"),
     State("erg-items-table", "selected_rows"),
+    State("erg-date-picker", "date"),
+    State("erg-upload", "filename"),
+    State("athlete-options-store", "data"),
     prevent_initial_call=True,
 )
-def modify_erg_table(add_clicks, del_clicks, rows, selected_rows):
+def modify_erg_table(
+    upload_contents,
+    add_clicks,
+    del_clicks,
+    apply_date_clicks,
+    rows,
+    selected_rows,
+    selected_date,
+    upload_filename,
+    athlete_options,
+):
     rows = rows or []
     selected_rows = selected_rows or []
+
+    if ctx.triggered_id == "erg-upload":
+        try:
+            uploaded_rows, incomplete, skipped_names = parse_erg_upload(
+                upload_contents,
+                upload_filename,
+                athlete_options,
+            )
+        except Exception as e:
+            return no_update, no_update, f"CSV upload failed: {e}", "danger", True
+
+        message = f"Loaded {len(uploaded_rows)} erg row(s) from {upload_filename}."
+        if incomplete:
+            message += f" {incomplete} row(s) need review before pushing."
+        if skipped_names:
+            message += " Skipped unmatched athlete(s): " + ", ".join(skipped_names) + "."
+        return uploaded_rows, [], message, "warning" if incomplete or skipped_names else "success", True
 
     if ctx.triggered_id == "erg-add-row":
         next_no = (max([r.get("row_no") or 0 for r in rows]) + 1) if rows else 1
         rows.append({
             "row_no": next_no,
             "profile_id": "",
+            "test_date": date.today().isoformat(),
             "distance_m": None,
             "stroke_rate_spm": None,
             "power_w": None,
+            "time_min": None,
             "time_s": None,
         })
-        return rows, []
+        return rows, [], no_update, no_update, no_update
 
     if ctx.triggered_id == "erg-delete-rows":
         if not selected_rows:
-            return no_update, no_update
+            return no_update, no_update, no_update, no_update, no_update
         keep = [r for i, r in enumerate(rows) if i not in set(selected_rows)]
-        return keep, []
+        return keep, [], no_update, no_update, no_update
 
-    return no_update, no_update
+    if ctx.triggered_id == "erg-apply-date":
+        if not selected_date:
+            return no_update, no_update, no_update, no_update, no_update
+        indexes = set(selected_rows) if selected_rows else set(range(len(rows)))
+        for i, row in enumerate(rows):
+            if i in indexes:
+                row["test_date"] = selected_date
+        return rows, selected_rows, no_update, no_update, no_update
+
+    return no_update, no_update, no_update, no_update, no_update
 
 
 @dash.callback(
@@ -1690,13 +2915,16 @@ def update_erg_summary(rows):
     if df.empty:
         return "0", "—", "—", "—"
 
-    for c in ["power_w", "stroke_rate_spm", "time_s"]:
+    for c in ["power_w", "stroke_rate_spm", "time_min", "time_s"]:
         if c not in df.columns:
             df[c] = None
 
     p = pd.to_numeric(df["power_w"], errors="coerce")
     r = pd.to_numeric(df["stroke_rate_spm"], errors="coerce")
-    t = pd.to_numeric(df["time_s"], errors="coerce")
+    t_s = pd.to_numeric(df["time_s"], errors="coerce")
+    t_min = pd.to_numeric(df["time_min"], errors="coerce")
+    t = (t_min.fillna(0) * 60) + t_s.fillna(0)
+    t = t.where(t_min.notna() | t_s.notna())
 
     avg_p = p.mean(skipna=True)
     avg_r = r.mean(skipna=True)
@@ -1704,7 +2932,7 @@ def update_erg_summary(rows):
 
     avg_p_txt = f"{avg_p:.1f} W" if pd.notna(avg_p) else "—"
     avg_r_txt = f"{avg_r:.1f} spm" if pd.notna(avg_r) else "—"
-    total_t_txt = f"{total_t:.0f} s" if pd.notna(total_t) else "—"
+    total_t_txt = f"{total_t / 60:.2f} min" if pd.notna(total_t) else "—"
 
     return str(len(rows)), avg_p_txt, avg_r_txt, total_t_txt
 
@@ -1722,3 +2950,283 @@ def download_erg_csv(n_clicks, rows):
         raise ValueError("Rows data should be a list of dictionaries")
     df = pd.DataFrame(rows)
     return dict(content=df.to_csv(index=False), filename="erg_batch_entry.csv", type="text/csv")
+
+
+@dash.callback(
+    Output("erg-submit-status", "children"),
+    Output("erg-submit-status", "color"),
+    Output("erg-submit-status", "is_open"),
+    Input("erg-submit", "n_clicks"),
+    State("erg-items-table", "data"),
+    prevent_initial_call=True,
+)
+def submit_erg_records(n_clicks, rows):
+    if not n_clicks:
+        raise PreventUpdate
+
+    if not ERG_TEST_SOURCE_UUID:
+        return "Push failed: ERG_TEST_SOURCE_UUID is not set in settings.py.", "danger", True
+
+    records = []
+    problems = []
+    blank_rows = 0
+
+    for index, row in enumerate(rows or []):
+        record = {
+            "row_no": row.get("row_no"),
+            "profile_id": row.get("profile_id"),
+            "test_date": row.get("test_date"),
+            "distance_m": row.get("distance_m"),
+            "stroke_rate_spm": row.get("stroke_rate_spm"),
+            "power_w": row.get("power_w"),
+            "time_min": row.get("time_min"),
+            "time_s": row.get("time_s"),
+        }
+
+        # A row counts as blank only when every data field is empty. Anything
+        # the practitioner actually typed is validated and reported, never
+        # dropped quietly for lacking one of the required fields.
+        if all(record[field] in (None, "") for field in ERG_DATA_FIELDS):
+            blank_rows += 1
+            continue
+
+        label = erg_row_label(record, index)
+
+        # Blank row numbers get filled from the table position instead of
+        # blowing up in int() with an unhelpful message.
+        if record["row_no"] in (None, ""):
+            record["row_no"] = index + 1
+
+        missing = [
+            ERG_FIELD_LABELS[field]
+            for field in ("profile_id", "test_date", "distance_m")
+            if record[field] in (None, "")
+        ]
+        if record["time_min"] in (None, "") and record["time_s"] in (None, ""):
+            missing.append("time (min or s)")
+        if missing:
+            problems.append(f"{label} is missing {', '.join(missing)}")
+            continue
+
+        try:
+            datetime.strptime(str(record["test_date"]), "%Y-%m-%d")
+        except (TypeError, ValueError):
+            problems.append(f"{label} has an invalid test date — use YYYY-MM-DD")
+            continue
+
+        try:
+            record["row_no"] = int(record["row_no"])
+            record["profile_id"] = int(record["profile_id"])
+            record["distance_m"] = int(record["distance_m"])
+            record["stroke_rate_spm"] = coerce_erg_positive_number(record["stroke_rate_spm"])
+            record["power_w"] = coerce_erg_positive_number(record["power_w"])
+            record["time_min"], record["time_s"] = normalize_erg_time_parts(
+                time_min=record["time_min"],
+                time_s=record["time_s"],
+            )
+            if record["time_min"] is None or record["time_s"] is None:
+                raise ValueError
+            record["time_min"] = coerce_erg_positive_number(record["time_min"])
+            record["time_s"] = coerce_erg_positive_number(record["time_s"])
+        except (TypeError, ValueError):
+            problems.append(f"{label} contains an invalid value — enter time as minutes and/or seconds")
+            continue
+
+        records.append(record)
+
+    # Report every bad row at once rather than one per push attempt.
+    if problems:
+        return (
+            "Push failed — nothing was sent. Fix these rows: " + "; ".join(problems) + ".",
+            "danger",
+            True,
+        )
+
+    if not records:
+        return "Push failed: enter at least one complete erg result.", "danger", True
+
+    try:
+        dataset, created = wc.ingest_raw(
+            source_uuid=ERG_TEST_SOURCE_UUID,
+            records=records,
+            subject_field="profile_id",
+            validate_client_side=False,
+        )
+        message = f"Submitted {created} erg row(s). Dataset UUID: {dataset['uuid']}"
+        if blank_rows:
+            message += f" ({blank_rows} blank row(s) ignored.)"
+        return message, "success", True
+    except WarehouseClientError as e:
+        if is_auth_error(e):
+            return auth_relogin_message("submit again"), "warning", True
+        return f"Push failed: {e}", "danger", True
+    except Exception as e:
+        if is_auth_error(e):
+            return auth_relogin_message("submit again"), "warning", True
+        return f"Push failed unexpectedly: {e}", "danger", True
+
+
+# =========================================================
+# TEMPLATE DOWNLOADS
+# =========================================================
+@dash.callback(
+    Output("bulk-step-template-csv", "data"),
+    Input("bulk-step-template-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def download_step_bulk_template(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    return dict(
+        content=step_template_csv(),
+        filename="step_test_bulk_template.csv",
+        type="text/csv",
+    )
+
+
+@dash.callback(
+    Output("erg-template-csv", "data"),
+    Input("erg-template-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def download_erg_template(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    return dict(
+        content=erg_template_csv(),
+        filename="erg_bulk_template.csv",
+        type="text/csv",
+    )
+
+
+# =========================================================
+# BULK STEP TEST UPLOAD CALLBACKS
+# =========================================================
+@dash.callback(
+    Output("bulk-step-records", "data"),
+    Output("bulk-step-preview", "data"),
+    Output("bulk-step-status", "children"),
+    Output("bulk-step-status", "color"),
+    Output("bulk-step-status", "is_open"),
+    Output("bulk-step-submit", "disabled"),
+    Output("bulk-step-submit", "children"),
+    Input("bulk-step-upload", "contents"),
+    State("bulk-step-upload", "filename"),
+    State("athlete-options-store", "data"),
+    prevent_initial_call=True,
+)
+def load_step_bulk_upload(contents, filename, athlete_options):
+    if not contents:
+        raise PreventUpdate
+
+    idle = (None, [], True, "Push to Warehouse")
+
+    if not athlete_options:
+        return (
+            *idle[:2],
+            "The athlete list has not loaded yet — wait a moment, then upload again.",
+            "warning",
+            True,
+            *idle[2:],
+        )
+
+    try:
+        records, preview, problems = parse_step_bulk_upload(
+            contents, filename, athlete_options
+        )
+    except Exception as e:
+        return (*idle[:2], f"CSV upload failed: {e}", "danger", True, *idle[2:])
+
+    if problems:
+        return (
+            *idle[:2],
+            problem_list(filename, problems),
+            "danger",
+            True,
+            *idle[2:],
+        )
+
+    message = (
+        f"Loaded {len(records)} step row(s) across {len(preview)} test session(s) "
+        f"from {filename}. Check the sessions below, then push."
+    )
+    return (
+        records,
+        preview,
+        message,
+        "success",
+        True,
+        False,
+        f"Push {len(records)} row(s) to Warehouse",
+    )
+
+
+@dash.callback(
+    Output("bulk-step-submit-status", "children"),
+    Output("bulk-step-submit-status", "color"),
+    Output("bulk-step-submit-status", "is_open"),
+    Output("bulk-step-fingerprint", "data"),
+    Output("bulk-step-submit", "disabled", allow_duplicate=True),
+    Input("bulk-step-submit", "n_clicks"),
+    State("bulk-step-records", "data"),
+    State("bulk-step-fingerprint", "data"),
+    prevent_initial_call=True,
+)
+def push_step_bulk_records(n_clicks, records, last_submission):
+    if not n_clicks:
+        raise PreventUpdate
+
+    if not records:
+        return "Nothing to push — upload a CSV first.", "warning", True, no_update, True
+
+    if not VO2_STEP_SOURCE_UUID:
+        return (
+            "Push failed: VO2_STEP_SOURCE_UUID is not set in settings.py.",
+            "danger",
+            True,
+            no_update,
+            False,
+        )
+
+    # session_id is derived from athlete and date, so a second push of the same
+    # sheet is indistinguishable downstream from the first. Catch it here.
+    fingerprint = submission_fingerprint(records)
+    last_submission = last_submission or {}
+    if last_submission.get("fingerprint") == fingerprint:
+        return (
+            (
+                "This exact file was already pushed at "
+                f"{last_submission.get('submitted_at', 'an earlier time')} "
+                f"(dataset {last_submission.get('dataset_uuid', 'unknown')}). "
+                "Upload a changed file if you need to push again."
+            ),
+            "warning",
+            True,
+            no_update,
+            True,
+        )
+
+    submitted_at = datetime.now().isoformat(timespec="seconds")
+    try:
+        dataset, created = wc.ingest_raw(
+            source_uuid=VO2_STEP_SOURCE_UUID,
+            records=records,
+            subject_field="profile_id",
+            validate_client_side=False,
+        )
+    except Exception as e:
+        if is_auth_error(e):
+            return auth_relogin_message("push again"), "warning", True, no_update, False
+        return f"Push failed: {e}", "danger", True, no_update, False
+
+    return (
+        f"Pushed {created} step row(s). Dataset UUID: {dataset.get('uuid')}",
+        "success",
+        True,
+        {
+            "fingerprint": fingerprint,
+            "dataset_uuid": dataset.get("uuid"),
+            "submitted_at": submitted_at,
+        },
+        True,
+    )

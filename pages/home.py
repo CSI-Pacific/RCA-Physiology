@@ -27,8 +27,12 @@ def layout():
                     dbc.Col(
                         html.Div(
                             [
-                                html.H2("Home", className="mb-0"),
-                                html.P("Welcome — choose a page to get started.", className="text-muted"),
+                                html.Div("PHYSIOLOGY", className="page-eyebrow"),
+                                html.H1("Home", className="mb-1"),
+                                html.P(
+                                    "Welcome — choose a page to get started.",
+                                    className="text-muted mb-0",
+                                ),
                             ]
                         ),
                         md=8,
@@ -37,7 +41,7 @@ def layout():
                     # profile container (populated by callback)
                     dbc.Col(html.Div(id="profile-container", className="d-flex justify-content-end"), md=4),
                 ],
-                className="align-items-center mb-3",
+                className="page-title-header align-items-center mt-4 mb-4",
             ),
 
             dbc.Row(
