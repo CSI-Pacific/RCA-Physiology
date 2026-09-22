@@ -40,6 +40,14 @@ Cloud: app → Settings → Variables). Do not deploy a `.env`.
 | `APP_URL` | no | Defaults to `DEPLOYED_APP_URL` in `settings.py`. Set it when the deployment URL changes, and register that URL as a redirect URI on the OAuth client. |
 | `SITE_URL` | no | Warehouse base URL. |
 | `FLASK_SECRET_KEY` | recommended | Keeps sessions valid across restarts and workers. |
+| `CLIENT_ID` | **do not set** | It is a literal in `settings.py`. A blank or mistyped value in a hosting panel overrides that default, and the provider answers with `Invalid client_id parameter value`. |
+
+On startup the app logs one line naming what it resolved, which is the fastest
+way to read a misconfigured deployment:
+
+```
+[settings] APP_URL=https://… SITE_URL=https://… client_id=...eZWLu4 client_secret=set
+```
 
 `APP_URL` must match a redirect URI registered on the OAuth application — the
 provider rejects anything else, which is why it is declared rather than read
