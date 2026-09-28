@@ -16,7 +16,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from auth_setup import auth
-from utils import fetch_profiles
+from utils import fetch_profiles, decode_csv_bytes
 
 from settings import SITE_URL, VO2_STEP_SOURCE_UUID, ERG_TEST_SOURCE_UUID
 from bulk_templates import (
@@ -778,7 +778,7 @@ def parse_erg_upload(contents, filename, athlete_options):
 
     _, encoded = contents.split(",", 1)
     decoded = base64.b64decode(encoded)
-    df = pd.read_csv(io.StringIO(decoded.decode("utf-8-sig")))
+    df = pd.read_csv(io.StringIO(decode_csv_bytes(decoded)))
     df = df.dropna(how="all")
     if df.empty:
         raise ValueError("The uploaded CSV has no data rows.")
@@ -992,7 +992,7 @@ def read_uploaded_csv(contents, filename):
 
     _, encoded = contents.split(",", 1)
     decoded = base64.b64decode(encoded)
-    return pd.read_csv(io.StringIO(decoded.decode("utf-8-sig")))
+    return pd.read_csv(io.StringIO(decode_csv_bytes(decoded)))
 
 
 def parse_step_bulk_rows(df, athlete_options):

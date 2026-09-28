@@ -8,6 +8,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from utils import decode_csv_bytes
+
 dash.register_page(__name__, path="/moxy", name="Moxy Analysis")
 
 
@@ -45,7 +47,7 @@ def parse_uploaded_csv(contents: str) -> pd.DataFrame:
     """
     content_type, content_string = contents.split(",")
     decoded = base64.b64decode(content_string)
-    return pd.read_csv(io.StringIO(decoded.decode("utf-8")), skiprows=3)
+    return pd.read_csv(io.StringIO(decode_csv_bytes(decoded)), skiprows=3)
 
 
 def parse_filename_parts(filename: str) -> dict:

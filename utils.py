@@ -1,3 +1,4 @@
+import re
 import requests
 from settings import SITE_URL
 
@@ -118,3 +119,36 @@ def restructure_profile(profile, format='profile'):
         record['org'] = profile['current_nomination']['organization']['name'] if profile['current_nomination'] else None
 
     return record
+
+CSV_ENCODINGS = ("utf-8-sig", "cp1252", "mac_roman", "latin-1")
+
+# Characters that legitimate spreadsheet text almost never contains. Used to
+# tell cp1252 and mac_roman apart, since both decode any byte without error but
+# only one of them gets accented names right.
+_IMPLAUSIBLE_CHARS = re.compile(r"[\u0080-\u009f\u00a0\u00ad\ufffd\u017d\u017e\u02c6-\u02dd\u2020-\u2026]")
+
+
+def decode_csv_bytes(raw, encodings=CSV_ENCODINGS):
+    """Decode CSV bytes, falling back through common spreadsheet encodings.
+
+    Excel exports (especially from Windows or older Macs) are rarely UTF-8, so a
+    strict utf-8 decode blows up on accented characters. utf-8 wins whenever it
+    is valid; otherwise the single-byte candidates are scored and the one
+    producing the fewest implausible characters is returned.
+    """
+    best = None
+    for encoding in encodings:
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if encoding.startswith("utf-8"):
+            return text
+        score = len(_IMPLAUSIBLE_CHARS.findall(text))
+        if best is None or score < best[0]:
+            best = (score, text)
+        if score == 0:
+            break
+    if best is None:
+        raise ValueError("Could not decode the uploaded CSV; try saving it as UTF-8.")
+    return best[1]
