@@ -17,6 +17,8 @@ from utils import fetch_profiles
 from settings import SITE_URL, VO2_STEP_SOURCE_UUID
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
 
+import erg_editor  # registers the Erg Scores tab and its callbacks
+
 
 cfg = WarehouseAPIConfig(base_url=SITE_URL)
 wc = WarehouseClient(cfg, token_getter=auth.get_token)
@@ -988,288 +990,309 @@ layout = dbc.Container(
         dcc.Store(id="reporting-data-store"),
         dcc.Store(id="reporting-edit-mode-store", data=False),
 
-        dbc.Row(
+        dbc.Tabs(
             [
-                dbc.Col(
-                    make_card(
-                        "Filters",
-                        [
-                            dbc.Label("Athlete"),
-                            dcc.Dropdown(
-                                id="reporting-athlete",
-                                options=[],
-                                placeholder="All athletes",
-                                value=None,
-                                clearable=True,
-                            ),
-                            html.Br(),
-
-                            dbc.Row(
-                                [
-                                    dbc.Col(
-                                        [
-                                            dbc.Label("Start Date"),
-                                            dcc.DatePickerSingle(
-                                                id="reporting-start-date",
-                                                date=(date.today() - timedelta(days=365)).isoformat(),
-                                                display_format="YYYY-MM-DD",
-                                                clearable=True,
-                                            ),
-                                        ],
-                                        md=6,
-                                    ),
-                                    dbc.Col(
-                                        [
-                                            dbc.Label("End Date"),
-                                            dcc.DatePickerSingle(
-                                                id="reporting-end-date",
-                                                date=(date.today() + timedelta(days=365)).isoformat(),
-                                                display_format="YYYY-MM-DD",
-                                                clearable=True,
-                                            ),
-                                        ],
-                                        md=6,
-                                    ),
-                                ],
-                                className="g-2",
-                            ),
-                            html.Br(),
-
-                            dbc.Row(
-                                [
-                                    dbc.Col(
-                                        [
-                                            dbc.Label("Test Type"),
-                                            dcc.Dropdown(
-                                                id="reporting-test-type",
-                                                options=[
-                                                    {"label": "All", "value": "all"},
-                                                    {"label": "Erg C2", "value": "erg_C2"},
-                                                    {"label": "Erg RP3", "value": "erg_RP3"},
-                                                    {"label": "On-Water", "value": "row"},
-                                                    {"label": "Bike", "value": "bike"},
-                                                    {"label": "Other", "value": "other"},
-                                                ],
-                                                value="all",
-                                                clearable=False,
-                                            ),
-                                        ],
-                                        md=6,
-                                    ),
-                                    dbc.Col(
-                                        [
-                                            dbc.Label("Mode"),
-                                            dcc.Dropdown(
-                                                id="reporting-mode",
-                                                options=[
-                                                    {"label": "All", "value": "all"},
-                                                    {"label": "Max", "value": "Max"},
-                                                    {"label": "Submax", "value": "Submax"},
-                                                ],
-                                                value="all",
-                                                clearable=False,
-                                            ),
-                                        ],
-                                        md=6,
-                                    ),
-                                ],
-                                className="g-2",
-                            ),
-                            html.Br(),
-                            dbc.Label("Max HR (bpm)"),
-                            dbc.Input(
-                                id="reporting-max-hr",
-                                type="number",
-                                min=100,
-                                max=240,
-                                step=1,
-                                placeholder="optional",
-                                value=None,
-                            ),
-                            html.Br(),
-
-                            dbc.Row(
-                                [
-                                    dbc.Col(
-                                        dbc.Button(
-                                            "Load Data",
-                                            id="reporting-load-btn",
-                                            color="primary",
-                                            className="w-100",
-                                        ),
-                                        md=6,
-                                    ),
-                                    dbc.Col(
-                                        dbc.Button(
-                                            "Download CSV",
-                                            id="reporting-download-btn",
-                                            color="info",
-                                            outline=True,
-                                            className="w-100",
-                                        ),
-                                        md=6,
-                                    ),
-                                ],
-                                className="g-2",
-                            ),
-                            html.Br(),
-                            dbc.Button(
-                                "Edit Data",
-                                id="reporting-edit-btn",
-                                color="secondary",
-                                outline=True,
-                                className="w-100",
-                            ),
-                            html.Div(
-                                [
-                                    dbc.Button(
-                                        "Revert Changes",
-                                        id="reporting-revert-btn",
-                                        color="secondary",
-                                        outline=True,
-                                        className="w-100",
-                                        disabled=True,
-                                    ),
-                                    dbc.Button(
-                                        "Review Changes",
-                                        id="reporting-update-btn",
-                                        color="success",
-                                        className="w-100 mt-2",
-                                        disabled=True,
-                                    ),
-                                ],
-                                className="mt-2",
-                            ),
-                            dcc.Download(id="reporting-download"),
-                            html.Hr(),
-                            dbc.Alert(id="reporting-status-msg", is_open=False),
-                            dbc.Alert(id="reporting-update-msg", is_open=False),
-                        ],
-                    ),
-                    md=3,
-                ),
-
-                dbc.Col(
-                    [
+                dbc.Tab(
+                    label="Step Tests",
+                    tab_id="tab-report-step-test",
+                    children=[
                         dbc.Row(
                             [
-                                dbc.Col(make_card("Rows", html.H4(id="reporting-rows", className="m-0")), md=3),
-                                dbc.Col(make_card("Sessions", html.H4(id="reporting-sessions", className="m-0")), md=3),
-                                dbc.Col(make_card("Avg PO", html.H4(id="reporting-avg-po", className="m-0")), md=3),
-                                dbc.Col(make_card("Avg HR", html.H4(id="reporting-avg-hr", className="m-0")), md=3),
+                                dbc.Col(
+                                    make_card(
+                                        "Filters",
+                                        [
+                                            dbc.Label("Athlete"),
+                                            dcc.Dropdown(
+                                                id="reporting-athlete",
+                                                options=[],
+                                                placeholder="All athletes",
+                                                value=None,
+                                                clearable=True,
+                                            ),
+                                            html.Br(),
+
+                                            dbc.Row(
+                                                [
+                                                    dbc.Col(
+                                                        [
+                                                            dbc.Label("Start Date"),
+                                                            dcc.DatePickerSingle(
+                                                                id="reporting-start-date",
+                                                                date=(date.today() - timedelta(days=365)).isoformat(),
+                                                                display_format="YYYY-MM-DD",
+                                                                clearable=True,
+                                                            ),
+                                                        ],
+                                                        md=6,
+                                                    ),
+                                                    dbc.Col(
+                                                        [
+                                                            dbc.Label("End Date"),
+                                                            dcc.DatePickerSingle(
+                                                                id="reporting-end-date",
+                                                                date=(date.today() + timedelta(days=365)).isoformat(),
+                                                                display_format="YYYY-MM-DD",
+                                                                clearable=True,
+                                                            ),
+                                                        ],
+                                                        md=6,
+                                                    ),
+                                                ],
+                                                className="g-2",
+                                            ),
+                                            html.Br(),
+
+                                            dbc.Row(
+                                                [
+                                                    dbc.Col(
+                                                        [
+                                                            dbc.Label("Test Type"),
+                                                            dcc.Dropdown(
+                                                                id="reporting-test-type",
+                                                                options=[
+                                                                    {"label": "All", "value": "all"},
+                                                                    {"label": "Erg C2", "value": "erg_C2"},
+                                                                    {"label": "Erg RP3", "value": "erg_RP3"},
+                                                                    {"label": "On-Water", "value": "row"},
+                                                                    {"label": "Bike", "value": "bike"},
+                                                                    {"label": "Other", "value": "other"},
+                                                                ],
+                                                                value="all",
+                                                                clearable=False,
+                                                            ),
+                                                        ],
+                                                        md=6,
+                                                    ),
+                                                    dbc.Col(
+                                                        [
+                                                            dbc.Label("Mode"),
+                                                            dcc.Dropdown(
+                                                                id="reporting-mode",
+                                                                options=[
+                                                                    {"label": "All", "value": "all"},
+                                                                    {"label": "Max", "value": "Max"},
+                                                                    {"label": "Submax", "value": "Submax"},
+                                                                ],
+                                                                value="all",
+                                                                clearable=False,
+                                                            ),
+                                                        ],
+                                                        md=6,
+                                                    ),
+                                                ],
+                                                className="g-2",
+                                            ),
+                                            html.Br(),
+                                            dbc.Label("Max HR (bpm)"),
+                                            dbc.Input(
+                                                id="reporting-max-hr",
+                                                type="number",
+                                                min=100,
+                                                max=240,
+                                                step=1,
+                                                placeholder="optional",
+                                                value=None,
+                                            ),
+                                            html.Br(),
+
+                                            dbc.Row(
+                                                [
+                                                    dbc.Col(
+                                                        dbc.Button(
+                                                            "Load Data",
+                                                            id="reporting-load-btn",
+                                                            color="primary",
+                                                            className="w-100",
+                                                        ),
+                                                        md=6,
+                                                    ),
+                                                    dbc.Col(
+                                                        dbc.Button(
+                                                            "Download CSV",
+                                                            id="reporting-download-btn",
+                                                            color="info",
+                                                            outline=True,
+                                                            className="w-100",
+                                                        ),
+                                                        md=6,
+                                                    ),
+                                                ],
+                                                className="g-2",
+                                            ),
+                                            html.Br(),
+                                            dbc.Button(
+                                                "Edit Data",
+                                                id="reporting-edit-btn",
+                                                color="secondary",
+                                                outline=True,
+                                                className="w-100",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    dbc.Button(
+                                                        "Revert Changes",
+                                                        id="reporting-revert-btn",
+                                                        color="secondary",
+                                                        outline=True,
+                                                        className="w-100",
+                                                        disabled=True,
+                                                    ),
+                                                    dbc.Button(
+                                                        "Review Changes",
+                                                        id="reporting-update-btn",
+                                                        color="success",
+                                                        className="w-100 mt-2",
+                                                        disabled=True,
+                                                    ),
+                                                ],
+                                                className="mt-2",
+                                            ),
+                                            dcc.Download(id="reporting-download"),
+                                            html.Hr(),
+                                            dbc.Alert(id="reporting-status-msg", is_open=False),
+                                            dbc.Alert(id="reporting-update-msg", is_open=False),
+                                        ],
+                                    ),
+                                    md=3,
+                                ),
+
+                                dbc.Col(
+                                    [
+                                        dbc.Row(
+                                            [
+                                                dbc.Col(make_card("Rows", html.H4(id="reporting-rows", className="m-0")), md=3),
+                                                dbc.Col(make_card("Sessions", html.H4(id="reporting-sessions", className="m-0")), md=3),
+                                                dbc.Col(make_card("Avg PO", html.H4(id="reporting-avg-po", className="m-0")), md=3),
+                                                dbc.Col(make_card("Avg HR", html.H4(id="reporting-avg-hr", className="m-0")), md=3),
+                                            ],
+                                            className="g-2 mb-3",
+                                        ),
+
+                                        make_card(
+                                            "Data Table",
+                                            dash_table.DataTable(
+                                                id="reporting-table",
+                                                data=[],
+                                                columns=build_reporting_table_columns(False),
+                                                hidden_columns=["__record_uuid", "profile_id", "__row_issues"],
+                                                editable=True,
+                                                page_action="native",
+                                                page_size=15,
+                                                sort_action="native",
+                                                filter_action="native",
+                                                dropdown={
+                                                    col: {"options": options}
+                                                    for col, options in REPORT_DROPDOWN_OPTIONS.items()
+                                                },
+                                                style_table={"overflowX": "auto"},
+                                                style_cell={
+                                                    "padding": "8px",
+                                                    "fontFamily": "system-ui",
+                                                    "fontSize": 14,
+                                                    "textAlign": "left",
+                                                    "minWidth": "100px",
+                                                    "maxWidth": "220px",
+                                                    "whiteSpace": "normal",
+                                                },
+                                                style_header={"fontWeight": "600"},
+                                                style_header_conditional=[
+                                                    {
+                                                        "if": {"column_id": col},
+                                                        "backgroundColor": "#e8f4ff",
+                                                        "color": "#0b4f79",
+                                                    }
+                                                    for col in REPORT_EDITABLE_COLUMNS
+                                                ],
+                                                style_data_conditional=[
+                                                    {
+                                                        "if": {"column_id": col},
+                                                        "backgroundColor": "#f3f9ff",
+                                                    }
+                                                    for col in REPORT_EDITABLE_COLUMNS
+                                                ],
+                                            ),
+                                        ),
+                                        html.Br(),
+                                        make_card(
+                                            "HR Training Zones (from Lactate Thresholds)",
+                                            dash_table.DataTable(
+                                                id="reporting-zones-table",
+                                                data=ZONES_DEFAULT_ROWS,
+                                                columns=ZONES_COLUMNS,
+                                                editable=False,
+                                                page_action="none",
+                                                style_table={"overflowX": "auto"},
+                                                style_cell={
+                                                    "padding": "8px",
+                                                    "fontFamily": "system-ui",
+                                                    "fontSize": 14,
+                                                    "textAlign": "left",
+                                                    "minWidth": "90px",
+                                                    "maxWidth": "220px",
+                                                    "whiteSpace": "normal",
+                                                },
+                                                style_header={"fontWeight": "600"},
+                                            ),
+                                        ),
+                                    ],
+                                    md=9,
+                                ),
                             ],
-                            className="g-2 mb-3",
+                            className="g-3",
                         ),
 
-                        make_card(
-                            "Data Table",
-                            dash_table.DataTable(
-                                id="reporting-table",
-                                data=[],
-                                columns=build_reporting_table_columns(False),
-                                hidden_columns=["__record_uuid", "profile_id", "__row_issues"],
-                                editable=True,
-                                page_action="native",
-                                page_size=15,
-                                sort_action="native",
-                                filter_action="native",
-                                dropdown={
-                                    col: {"options": options}
-                                    for col, options in REPORT_DROPDOWN_OPTIONS.items()
-                                },
-                                style_table={"overflowX": "auto"},
-                                style_cell={
-                                    "padding": "8px",
-                                    "fontFamily": "system-ui",
-                                    "fontSize": 14,
-                                    "textAlign": "left",
-                                    "minWidth": "100px",
-                                    "maxWidth": "220px",
-                                    "whiteSpace": "normal",
-                                },
-                                style_header={"fontWeight": "600"},
-                                style_header_conditional=[
-                                    {
-                                        "if": {"column_id": col},
-                                        "backgroundColor": "#e8f4ff",
-                                        "color": "#0b4f79",
-                                    }
-                                    for col in REPORT_EDITABLE_COLUMNS
-                                ],
-                                style_data_conditional=[
-                                    {
-                                        "if": {"column_id": col},
-                                        "backgroundColor": "#f3f9ff",
-                                    }
-                                    for col in REPORT_EDITABLE_COLUMNS
-                                ],
-                            ),
+                        html.Hr(),
+
+                        dbc.Row(
+                            [
+                                dbc.Col(dcc.Graph(id="reporting-po-hr-plot", config={"displayModeBar": False}), md=6),
+                                dbc.Col(dcc.Graph(id="reporting-po-la-plot", config={"displayModeBar": False}), md=6),
+                            ],
+                            className="g-2",
                         ),
-                        html.Br(),
-                        make_card(
-                            "HR Training Zones (from Lactate Thresholds)",
-                            dash_table.DataTable(
-                                id="reporting-zones-table",
-                                data=ZONES_DEFAULT_ROWS,
-                                columns=ZONES_COLUMNS,
-                                editable=False,
-                                page_action="none",
-                                style_table={"overflowX": "auto"},
-                                style_cell={
-                                    "padding": "8px",
-                                    "fontFamily": "system-ui",
-                                    "fontSize": 14,
-                                    "textAlign": "left",
-                                    "minWidth": "90px",
-                                    "maxWidth": "220px",
-                                    "whiteSpace": "normal",
-                                },
-                                style_header={"fontWeight": "600"},
-                            ),
+                        dbc.Row(
+                            [
+                                dbc.Col(dcc.Graph(id="reporting-session-trend-plot", config={"displayModeBar": False}), md=12),
+                            ],
+                            className="g-2 mt-2",
+                        ),
+
+                        dbc.Modal(
+                            [
+                                dbc.ModalHeader(dbc.ModalTitle("Review Warehouse Changes")),
+                                dbc.ModalBody(id="reporting-change-summary"),
+                                dbc.ModalFooter(
+                                    [
+                                        dbc.Button("Cancel", id="reporting-cancel-update-btn", color="secondary", outline=True),
+                                        dbc.Button(
+                                            "Update Warehouse",
+                                            id="reporting-confirm-update-btn",
+                                            color="success",
+                                            disabled=True,
+                                        ),
+                                    ]
+                                ),
+                            ],
+                            id="reporting-review-modal",
+                            size="lg",
+                            is_open=False,
+                            scrollable=True,
                         ),
                     ],
-                    md=9,
+                ),
+
+                # The erg tab carries its own filters, table and review
+                # modal; see erg_editor.py.
+                dbc.Tab(
+                    label="Erg Scores",
+                    tab_id="tab-report-erg",
+                    children=[erg_editor.layout],
                 ),
             ],
-            className="g-3",
-        ),
-
-        html.Hr(),
-
-        dbc.Row(
-            [
-                dbc.Col(dcc.Graph(id="reporting-po-hr-plot", config={"displayModeBar": False}), md=6),
-                dbc.Col(dcc.Graph(id="reporting-po-la-plot", config={"displayModeBar": False}), md=6),
-            ],
-            className="g-2",
-        ),
-        dbc.Row(
-            [
-                dbc.Col(dcc.Graph(id="reporting-session-trend-plot", config={"displayModeBar": False}), md=12),
-            ],
-            className="g-2 mt-2",
-        ),
-
-        dbc.Modal(
-            [
-                dbc.ModalHeader(dbc.ModalTitle("Review Warehouse Changes")),
-                dbc.ModalBody(id="reporting-change-summary"),
-                dbc.ModalFooter(
-                    [
-                        dbc.Button("Cancel", id="reporting-cancel-update-btn", color="secondary", outline=True),
-                        dbc.Button(
-                            "Update Warehouse",
-                            id="reporting-confirm-update-btn",
-                            color="success",
-                            disabled=True,
-                        ),
-                    ]
-                ),
-            ],
-            id="reporting-review-modal",
-            size="lg",
-            is_open=False,
-            scrollable=True,
+            id="reporting-tabs",
+            active_tab="tab-report-step-test",
+            className="mt-2",
         ),
     ],
     fluid=True,
