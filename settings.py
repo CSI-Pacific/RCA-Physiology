@@ -77,8 +77,23 @@ RAW_INGEST_ENDPOINT = "/api/warehouse/ingestion/primary/"
 VO2_STEP_SOURCE_UUID = _env(
     "VO2_STEP_SOURCE_UUID", "144f56a2-f10e-4c4b-bd8a-98afdc025f93"
 )
+# The erg data source the app reads and writes. This moved when the schema
+# gained `protocol` and free-form distances: rather than add a definition to the
+# source holding four years of 2k and 6k results, a fresh source was registered
+# and the history migrated across by scripts/migrate_erg_records.py.
+#
+# PASTE THE NEW DATA SOURCE UUID HERE. Until it is set, the app still points at
+# the old source, whose schema rejects every push that carries a protocol.
 ERG_TEST_SOURCE_UUID = _env(
-    "ERG_TEST_SOURCE_UUID", "992c95a6-86ba-47e8-8bf4-0d67dd1838e4"
+    "ERG_TEST_SOURCE_UUID", "621b995b-b36d-4085-a4f4-69b598116fd6"
+)
+
+# Where the pre-migration erg results live. Kept named rather than deleted: it
+# is the only copy of four years of testing until the migration is verified, and
+# it stays readable afterwards as the thing to check against if a number ever
+# looks wrong.
+ERG_TEST_LEGACY_SOURCE_UUID = _env(
+    "ERG_TEST_LEGACY_SOURCE_UUID", "992c95a6-86ba-47e8-8bf4-0d67dd1838e4"
 )
 
 

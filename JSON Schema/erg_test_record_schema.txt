@@ -2,12 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://csipacific.ca/schemas/erg_test_record.schema.json",
   "title": "Erg Test Record",
-  "description": "One record per athlete row ingested from the batch erg entry table in pages/entry.py.",
+  "description": "One record per athlete row ingested from the batch erg entry table in pages/entry.py, or corrected through the Erg Scores tab of pages/reports.py.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "profile_id",
     "test_date",
+    "protocol",
     "distance_m",
     "power_w",
     "time_min",
@@ -29,13 +30,20 @@
       "format": "date",
       "description": "Date of the erg test (YYYY-MM-DD)."
     },
+    "protocol": {
+      "type": "string",
+      "enum": [
+        "2k",
+        "6k",
+        "30min",
+        "custom"
+      ],
+      "description": "Which piece this result belongs to. Distance is prescribed for 2k and 6k and is the result for 30min, so this -- not distance_m -- is what groups comparable results. Records written before this field existed are read as 2k or 6k from their distance."
+    },
     "distance_m": {
       "type": "integer",
-      "enum": [
-        2000,
-        6000
-      ],
-      "description": "Erg test distance in metres."
+      "minimum": 1,
+      "description": "Distance in metres: the prescribed distance for a 2k or 6k, the distance covered for a time-capped piece such as 30min."
     },
     "stroke_rate_spm": {
       "type": "number",

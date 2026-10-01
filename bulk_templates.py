@@ -80,11 +80,12 @@ STEP_TEMPLATE_EXAMPLE_ROWS = (
     },
 )
 
-# One row per athlete per distance.
+# One row per athlete per piece.
 ERG_TEMPLATE_COLUMNS = (
     "athlete",
     "profile_id",
     "test_date",
+    "protocol",
     "distance_m",
     "stroke_rate_spm",
     "power_w",
@@ -94,21 +95,37 @@ ERG_TEMPLATE_COLUMNS = (
 
 # time_min/time_s are whole minutes plus the leftover seconds, i.e. 7:12.4 is
 # time_min 7, time_s 12.4 — not 7 and 432.4.
+#
+# The third and fourth rows are 30-minute pieces: the clock is the constant and
+# the distance is the result, which is why distance_m differs between two
+# athletes who rowed the same test. Leaving protocol blank is allowed — it is
+# read back from the distance and duration — but a 30-minute piece is worth
+# naming, since only the protocol tells it apart from an unusual time trial.
 ERG_TEMPLATE_EXAMPLE_ROWS = (
     {
         "athlete": "Example Athlete", "test_date": "2026-09-15",
-        "distance_m": 2000, "stroke_rate_spm": 32, "power_w": 245,
-        "time_min": 7, "time_s": 12.4,
+        "protocol": "2k", "distance_m": 2000, "stroke_rate_spm": 32,
+        "power_w": 245, "time_min": 7, "time_s": 12.4,
     },
     {
         "athlete": "Example Athlete", "test_date": "2026-09-15",
-        "distance_m": 6000, "stroke_rate_spm": 26, "power_w": 205,
-        "time_min": 23, "time_s": 4.8,
+        "protocol": "6k", "distance_m": 6000, "stroke_rate_spm": 26,
+        "power_w": 205, "time_min": 23, "time_s": 4.8,
+    },
+    {
+        "athlete": "Example Athlete", "test_date": "2026-09-22",
+        "protocol": "30min", "distance_m": 8420, "stroke_rate_spm": 24,
+        "power_w": 212, "time_min": 30, "time_s": 0,
+    },
+    {
+        "athlete": "Sample Athlete-Two", "test_date": "2026-09-22",
+        "protocol": "30min", "distance_m": 9015, "stroke_rate_spm": 25,
+        "power_w": 258, "time_min": 30, "time_s": 0,
     },
     {
         "athlete": "Sample Athlete-Two", "test_date": "2026-09-15",
-        "distance_m": 2000, "stroke_rate_spm": 34, "power_w": 398,
-        "time_min": 6, "time_s": 8.1,
+        "protocol": "2k", "distance_m": 2000, "stroke_rate_spm": 34,
+        "power_w": 398, "time_min": 6, "time_s": 8.1,
     },
 )
 

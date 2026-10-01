@@ -10,7 +10,7 @@ one here.
 | Template | Use it for | Where it goes |
 | --- | --- | --- |
 | `step_test_bulk_template.csv` | Step tests (many athletes, many steps each) | Entry → **Bulk Step Upload** tab |
-| `erg_bulk_template.csv` | 2000 m / 6000 m erg results | Entry → **Erg Test** tab |
+| `erg_bulk_template.csv` | Erg results — 2 k, 6 k, 30 min | Entry → **Erg Test** tab |
 
 ## How to fill them in
 
@@ -62,16 +62,29 @@ type or a different note on the second one.
 
 ### Erg template specifically
 
-One row per athlete per distance, so an athlete who did both a 2 k and a 6 k gets
-two rows. `distance_m` is `2000` or `6000`.
+One row per athlete per piece, so an athlete who did both a 2 k and a 6 k gets
+two rows.
+
+`protocol` names the piece: `2k`, `6k`, `30min` or `custom`. It is what groups
+comparable results, because distance no longer tells them apart — on a 30-minute
+piece the clock is fixed and `distance_m` is the **result**, different for every
+athlete. `distance_m` accepts any distance.
+
+Leave `protocol` out and it is read back from the distance and the duration
+(2000 → `2k`, 6000 → `6k`, anything lasting about half an hour → `30min`,
+otherwise `custom`). Name it explicitly for a timed piece — an athlete who stops
+at 27 minutes would otherwise be filed as `custom`.
 
 Times are **whole minutes plus the leftover seconds**: a 7:12.4 2 k is
-`time_min = 7`, `time_s = 12.4` — not `7` and `432.4`. If your sheet has a single
-`time` column written as `7:12.4`, that works too; use it instead of the two.
+`time_min = 7`, `time_s = 12.4` — not `7` and `432.4`. For a 30-minute piece that
+is `time_min = 30`, `time_s = 0`. If your sheet has a single `time` column
+written as `7:12.4`, that works too; use it instead of the two.
 
 If you already keep a wide sheet with one row per athlete and columns like
 `2000m Erg Power` and `6000m Erg Rate`, upload that directly instead; it gets
-split into one row per distance for you.
+split into one row per distance for you, with the protocol filled in. The wide
+format only recognises 2000 m and 6000 m headers — 30-minute results go in the
+long format above, or straight into the entry table.
 
 ## What happens after you upload
 

@@ -19,6 +19,15 @@ from auth_setup import auth
 from utils import fetch_profiles, decode_csv_bytes
 
 from settings import SITE_URL, VO2_STEP_SOURCE_UUID, ERG_TEST_SOURCE_UUID
+from erg_protocols import (
+    ERG_PROTOCOL_OPTIONS,
+    ERG_PROTOCOL_VALUES,
+    PROTOCOL_FIXED_DISTANCE,
+    PROTOCOL_FIXED_TIME_MIN,
+    infer_protocol,
+    normalize_protocol,
+    protocol_label,
+)
 from bulk_templates import (
     ERG_TEMPLATE_COLUMNS,
     STEP_TEMPLATE_COLUMNS,
@@ -105,6 +114,7 @@ def blank_erg_row(row_no=None, test_date=None):
         "row_no": row_no,
         "profile_id": "",
         "test_date": test_date or date.today().isoformat(),
+        "protocol": None,
         "distance_m": None,
         "stroke_rate_spm": None,
         "power_w": None,
@@ -119,8 +129,9 @@ def blank_erg_rows(n=ERG_DEFAULT_ROW_COUNT):
 ERG_TABLE_COLUMNS = [
     {"name": "Row", "id": "row_no", "type": "numeric"},
     {"name": "Test Date", "id": "test_date", "type": "text"},
+    {"name": "Test", "id": "protocol", "type": "text", "presentation": "dropdown"},
     {"name": "Athlete", "id": "profile_id", "type": "text", "presentation": "dropdown"},
-    {"name": "Distance (m)", "id": "distance_m", "type": "numeric", "presentation": "dropdown"},
+    {"name": "Distance (m)", "id": "distance_m", "type": "numeric"},
     {"name": "Stroke Rate (spm)", "id": "stroke_rate_spm", "type": "numeric"},
     {"name": "Power (W)", "id": "power_w", "type": "numeric"},
     {"name": "Time (min)", "id": "time_min", "type": "numeric"},
@@ -132,6 +143,7 @@ ERG_UPLOAD_COLUMN_ALIASES = {
     "profile_id": {"profileid", "athleteid", "subjectid"},
     "athlete": {"athlete", "name", "fullname", "athletename", "about"},
     "test_date": {"testdate", "date", "testday"},
+    "protocol": {"protocol", "test", "testname", "piece", "event", "ergtest"},
     "distance_m": {"distancem", "distance", "metres", "meters", "ergdistance"},
     "stroke_rate_spm": {
         "strokeratespm",
@@ -591,7 +603,7 @@ def finalize_erg_upload_rows(rows, skipped_names=None):
     incomplete = 0
     for i, row in enumerate(rows, start=1):
         row["row_no"] = i
-        required = ["profile_id", "test_date", "distance_m"]
+        required = ["profile_id", "test_date", "protocol", "distance_m"]
         is_incomplete = any(row.get(field) in (None, "") for field in required)
         if row.get("time_min") in (None, "") and row.get("time_s") in (None, ""):
             is_incomplete = True
@@ -602,6 +614,7 @@ def finalize_erg_upload_rows(rows, skipped_names=None):
 
 ERG_DATA_FIELDS = (
     "profile_id",
+    "protocol",
     "distance_m",
     "stroke_rate_spm",
     "power_w",
@@ -612,6 +625,7 @@ ERG_DATA_FIELDS = (
 ERG_FIELD_LABELS = {
     "profile_id": "athlete",
     "test_date": "test date",
+    "protocol": "test",
     "distance_m": "distance (m)",
     "stroke_rate_spm": "stroke rate",
     "power_w": "power",
@@ -636,7 +650,7 @@ ERG_ROW_STARTED = "!(" + " && ".join(
 
 def erg_missing_cell_styles():
     styles = []
-    for field in ("profile_id", "test_date", "distance_m"):
+    for field in ("profile_id", "test_date", "protocol", "distance_m"):
         styles.append(
             {
                 "if": {
@@ -715,7 +729,7 @@ def detect_erg_wide_columns(columns):
     return wide
 
 
-def build_erg_upload_row(profile_id, test_date, distance, values):
+def build_erg_upload_row(profile_id, test_date, distance, values, protocol=None):
     time_min, time_s = normalize_erg_time_parts(
         time_min=values.get("time_min"),
         time_s=values.get("time_s"),
@@ -727,16 +741,69 @@ def build_erg_upload_row(profile_id, test_date, distance, values):
     stroke_rate = pd.to_numeric(values.get("stroke_rate_spm"), errors="coerce")
     power = pd.to_numeric(values.get("power_w"), errors="coerce")
 
+    total_seconds = None
+    if time_min not in (None, "") or time_s not in (None, ""):
+        total_seconds = (float(time_min or 0) * 60) + float(time_s or 0)
+
     return {
         "row_no": None,
         "profile_id": profile_id or "",
         "test_date": test_date or "",
+        "protocol": protocol or infer_protocol(distance, total_seconds),
         "distance_m": distance,
         "stroke_rate_spm": float(stroke_rate) if pd.notna(stroke_rate) else "NA",
         "power_w": float(power) if pd.notna(power) else "NA",
         "time_min": time_min,
         "time_s": time_s,
     }
+
+
+def apply_erg_protocol_defaults(rows):
+    """Fill in whatever the chosen piece prescribes, and report if anything moved.
+
+    A 2k and a 6k prescribe their distance; a 30-minute piece prescribes its
+    duration and leaves the distance as the result. Filling that in is the
+    difference between picking the test and typing it twice.
+
+    A value already in the cell is left alone unless it is the fixed distance of
+    a *different* piece -- that is a leftover from the previous choice, not
+    something the practitioner meant, and leaving 2000 sitting under a 6k is the
+    one way this could quietly record the wrong test.
+    """
+    fixed_distances = set(PROTOCOL_FIXED_DISTANCE.values())
+    changed = False
+
+    for row in rows or []:
+        protocol = normalize_protocol(row.get("protocol"))
+        if not protocol:
+            continue
+
+        current = pd.to_numeric(row.get("distance_m"), errors="coerce")
+        is_blank = pd.isna(current)
+        looks_prescribed = (not is_blank) and int(current) in fixed_distances
+        distance = PROTOCOL_FIXED_DISTANCE.get(protocol)
+        minutes = PROTOCOL_FIXED_TIME_MIN.get(protocol)
+        has_time = any(row.get(field) not in (None, "") for field in ("time_min", "time_s"))
+
+        if distance is not None:
+            if is_blank or (looks_prescribed and int(current) != distance):
+                row["distance_m"] = distance
+                changed = True
+        elif looks_prescribed and not has_time:
+            # Switched off a 2k or 6k onto a piece that prescribes no distance,
+            # before anything else was typed: the 2000 sitting there is the old
+            # choice, not a result. Clearing it is checked against the time
+            # being empty so the rule cannot fire twice -- by the next pass a
+            # timed piece has its duration filled in, and a distance the
+            # practitioner typed themselves is never touched again.
+            row["distance_m"] = None
+            changed = True
+
+        if minutes is not None and not has_time:
+            row["time_min"] = minutes
+            changed = True
+
+    return rows, changed
 
 
 def parse_wide_erg_upload(df, by_name):
@@ -765,7 +832,11 @@ def parse_wide_erg_upload(df, by_name):
             }
             if all(clean_value(value) is None for value in values.values()):
                 continue
-            rows.append(build_erg_upload_row(profile_id, test_date, distance, values))
+            rows.append(
+                build_erg_upload_row(
+                    profile_id, test_date, distance, values, infer_protocol(distance)
+                )
+            )
 
     return finalize_erg_upload_rows(rows, unresolved_names)
 
@@ -812,6 +883,7 @@ def parse_erg_upload(contents, filename, athlete_options):
 
         row_no = pd.to_numeric(raw.get("row_no"), errors="coerce")
         distance = pd.to_numeric(raw.get("distance_m"), errors="coerce")
+        protocol = normalize_protocol(raw.get("protocol"))
         stroke_rate = pd.to_numeric(raw.get("stroke_rate_spm"), errors="coerce")
         power = pd.to_numeric(raw.get("power_w"), errors="coerce")
         time_min, time_s = normalize_erg_time_parts(
@@ -821,11 +893,18 @@ def parse_erg_upload(contents, filename, athlete_options):
             distance=distance if pd.notna(distance) else None,
         )
 
+        total_seconds = None
+        if time_min not in (None, "") or time_s not in (None, ""):
+            total_seconds = (float(time_min or 0) * 60) + float(time_s or 0)
+
         rows.append(
             {
                 "row_no": int(row_no) if pd.notna(row_no) else len(rows) + 1,
                 "profile_id": profile_id or "",
                 "test_date": parse_upload_date(raw.get("test_date")) or "",
+                "protocol": protocol or infer_protocol(
+                    int(distance) if pd.notna(distance) else None, total_seconds
+                ),
                 "distance_m": int(distance) if pd.notna(distance) else None,
                 "stroke_rate_spm": float(stroke_rate) if pd.notna(stroke_rate) else "NA",
                 "power_w": float(power) if pd.notna(power) else "NA",
@@ -1725,9 +1804,10 @@ layout = dbc.Container(
                                 html.Small(
                                     "Times are whole minutes plus the leftover seconds — a 7:12.4 2k is "
                                     "time_min 7, time_s 12.4. A single \"time\" column written as 7:12.4 "
-                                    "works instead. A wide sheet works too: columns named like "
-                                    "\"2000m Erg Power\" or \"6000m Erg Rate\" are split into one row per "
-                                    "distance automatically.",
+                                    "works instead. A \"protocol\" column names the piece (2k, 6k, 30min); "
+                                    "leave it out and it is read from the distance and the duration. A wide "
+                                    "sheet works too: columns named like \"2000m Erg Power\" or \"6000m Erg "
+                                    "Rate\" are split into one row per distance automatically.",
                                     className="text-muted d-block mb-3",
                                 ),
                                 # One toolbar instead of two stacked rows: the date
@@ -1813,12 +1893,9 @@ layout = dbc.Container(
                                                 "clearable": True,
                                                 "options": [],
                                             },
-                                            "distance_m": {
+                                            "protocol": {
                                                 "clearable": False,
-                                                "options": [
-                                                    {"label": "2000", "value": 2000},
-                                                    {"label": "6000", "value": 6000},
-                                                ],
+                                                "options": ERG_PROTOCOL_OPTIONS,
                                             },
                                         },
                                         editable=True,
@@ -1856,7 +1933,7 @@ layout = dbc.Container(
                                                 "backgroundColor": "#fbfdff",
                                             },
                                             {
-                                                "if": {"column_id": "distance_m"},
+                                                "if": {"column_id": "protocol"},
                                                 "backgroundColor": "#fbfdff",
                                             },
                                             {
@@ -1871,6 +1948,7 @@ layout = dbc.Container(
                                         style_cell_conditional=[
                                             {"if": {"column_id": "row_no"}, "width": "60px", "color": "#6c757d"},
                                             {"if": {"column_id": "test_date"}, "width": "120px"},
+                                            {"if": {"column_id": "protocol"}, "width": "120px"},
                                             {"if": {"column_id": "profile_id"}, "width": "280px", "minWidth": "240px", "textAlign": "left"},
                                             {"if": {"column_id": "distance_m"}, "width": "120px"},
                                             {"if": {"column_id": "stroke_rate_spm"}, "width": "120px"},
@@ -1880,7 +1958,8 @@ layout = dbc.Container(
                                         ],
                                         tooltip_header={
                                             "profile_id": "Required. Pick from the athlete list.",
-                                            "distance_m": "Required. 2000 or 6000.",
+                                            "protocol": "Which piece this is. 2000 m and 6000 m fill in the distance; 30 min fills in the time and you enter the distance rowed.",
+                                            "distance_m": "Required. Prescribed for a 2k or 6k, the distance covered for a 30 min piece.",
                                             "time_min": "Whole minutes only \u2014 7:12.4 is 7 here.",
                                             "time_s": "Leftover seconds \u2014 7:12.4 is 12.4 here.",
                                         },
@@ -2184,12 +2263,9 @@ def apply_athlete_options(options):
                 "clearable": True,
                 "options": [],
             },
-            "distance_m": {
+            "protocol": {
                 "clearable": False,
-                "options": [
-                    {"label": "2000", "value": 2000},
-                    {"label": "6000", "value": 6000},
-                ],
+                "options": ERG_PROTOCOL_OPTIONS,
             },
         }
 
@@ -2203,12 +2279,9 @@ def apply_athlete_options(options):
             "clearable": True,
             "options": erg_options,
         },
-        "distance_m": {
+        "protocol": {
             "clearable": False,
-            "options": [
-                {"label": "2000", "value": 2000},
-                {"label": "6000", "value": 6000},
-            ],
+            "options": ERG_PROTOCOL_OPTIONS,
         },
     }
 # =========================================================
@@ -2276,6 +2349,24 @@ def apply_mode_to_all_rows(mode, rows):
 def save_step_draft(rows):
     """Mirror every step-table edit into session storage."""
     return rows
+
+
+@dash.callback(
+    Output("erg-items-table", "data", allow_duplicate=True),
+    Input("erg-items-table", "data"),
+    prevent_initial_call=True,
+)
+def fill_erg_protocol_defaults(rows):
+    """Picking a piece fills in what that piece prescribes.
+
+    This writes back to the table it watches, so it only returns when something
+    actually moved -- the fill is idempotent, and a no-op update would bounce
+    between this callback and the draft store forever.
+    """
+    filled, changed = apply_erg_protocol_defaults([dict(r) for r in (rows or [])])
+    if not changed:
+        raise PreventUpdate
+    return filled
 
 
 @dash.callback(
@@ -2871,16 +2962,12 @@ def modify_erg_table(
 
     if ctx.triggered_id == "erg-add-row":
         next_no = (max([r.get("row_no") or 0 for r in rows]) + 1) if rows else 1
-        rows.append({
-            "row_no": next_no,
-            "profile_id": "",
-            "test_date": date.today().isoformat(),
-            "distance_m": None,
-            "stroke_rate_spm": None,
-            "power_w": None,
-            "time_min": None,
-            "time_s": None,
-        })
+        new_row = blank_erg_row(next_no)
+        # Carry the piece down from the row above: a session is nearly always
+        # one protocol, so the practitioner picks it once.
+        if rows:
+            new_row["protocol"] = rows[-1].get("protocol")
+        rows.append(new_row)
         return rows, [], no_update, no_update, no_update
 
     if ctx.triggered_id == "erg-delete-rows":
@@ -2972,10 +3059,12 @@ def submit_erg_records(n_clicks, rows):
     blank_rows = 0
 
     for index, row in enumerate(rows or []):
+        raw_protocol = row.get("protocol")
         record = {
             "row_no": row.get("row_no"),
             "profile_id": row.get("profile_id"),
             "test_date": row.get("test_date"),
+            "protocol": normalize_protocol(raw_protocol),
             "distance_m": row.get("distance_m"),
             "stroke_rate_spm": row.get("stroke_rate_spm"),
             "power_w": row.get("power_w"),
@@ -2997,15 +3086,29 @@ def submit_erg_records(n_clicks, rows):
         if record["row_no"] in (None, ""):
             record["row_no"] = index + 1
 
+        if record["protocol"] is None and raw_protocol not in (None, ""):
+            problems.append(
+                f"{label} has an unrecognised test \"{raw_protocol}\" — use one of "
+                + ", ".join(protocol_label(p) for p in ERG_PROTOCOL_VALUES)
+            )
+            continue
+
         missing = [
             ERG_FIELD_LABELS[field]
-            for field in ("profile_id", "test_date", "distance_m")
+            for field in ("profile_id", "test_date", "protocol", "distance_m")
             if record[field] in (None, "")
         ]
         if record["time_min"] in (None, "") and record["time_s"] in (None, ""):
             missing.append("time (min or s)")
         if missing:
             problems.append(f"{label} is missing {', '.join(missing)}")
+            continue
+
+        if record["protocol"] not in ERG_PROTOCOL_VALUES:
+            problems.append(
+                f"{label} has an unknown test — use one of "
+                + ", ".join(protocol_label(p) for p in ERG_PROTOCOL_VALUES)
+            )
             continue
 
         try:

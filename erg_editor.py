@@ -23,6 +23,12 @@ import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
 
 from auth_setup import auth
+from erg_protocols import (
+    ERG_PROTOCOL_OPTIONS,
+    ERG_PROTOCOL_VALUES,
+    infer_protocol,
+    protocol_label,
+)
 from settings import SITE_URL, ERG_TEST_SOURCE_UUID
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
 
@@ -44,6 +50,7 @@ ERG_DATA_COLUMNS = [
     "row_no",
     "profile_id",
     "test_date",
+    "protocol",
     "distance_m",
     "stroke_rate_spm",
     "power_w",
@@ -56,6 +63,7 @@ ERG_TABLE_COLUMNS = [
     {"name": "Athlete", "id": "athlete_name", "editable": False},
     {"name": "Athlete ID", "id": "profile_id", "editable": False},
     {"name": "Test Date", "id": "test_date", "editable": True},
+    {"name": "Test", "id": "protocol", "editable": True, "presentation": "dropdown"},
     {"name": "Distance (m)", "id": "distance_m", "editable": True},
     {"name": "Stroke Rate (spm)", "id": "stroke_rate_spm", "editable": True},
     {"name": "Power (W)", "id": "power_w", "editable": True},
@@ -96,18 +104,14 @@ ERG_SENTINEL_COLUMNS = {"stroke_rate_spm", "power_w", "time_min", "time_s"}
 # Bounds are advisory: they catch a slipped decimal point, not an unusual
 # athlete. Anything outside them blocks the update until it is corrected.
 ERG_NUMERIC_RANGES = {
-    "distance_m": (100, 100000, "Distance should be between 100 and 100,000 m."),
+    "distance_m": (100, 50000, "Distance should be between 100 and 50,000 m."),
     "stroke_rate_spm": (10, 60, "Stroke rate should be between 10 and 60 spm."),
     "power_w": (20, 1200, "Power should be between 20 and 1200 W."),
     "time_min": (0, 600, "Time (min) should be between 0 and 600."),
     "time_s": (0, 60, "Time (s) is the seconds part -- use 0 to 59.99."),
 }
 
-ERG_DISTANCE_FILTER_OPTIONS = [
-    {"label": "All", "value": "all"},
-    {"label": "2000 m", "value": "2000"},
-    {"label": "6000 m", "value": "6000"},
-]
+ERG_PROTOCOL_FILTER_OPTIONS = [{"label": "All", "value": "all"}] + ERG_PROTOCOL_OPTIONS
 
 
 # =========================================================
@@ -251,8 +255,9 @@ def display_value(value, column_id=None):
 def row_label(row):
     athlete = row.get("athlete_name") or row.get("profile_id") or "Athlete"
     test_date = display_value(row.get("test_date"))
+    piece = protocol_label(row.get("protocol"))
     distance = display_value(row.get("distance_m"), "distance_m")
-    return f"{athlete} | {test_date} | {distance} m"
+    return f"{athlete} | {test_date} | {piece} | {distance} m"
 
 
 def row_to_warehouse_payload(row):
@@ -298,10 +303,20 @@ def normalize_erg_records_to_df(records):
 
     df["test_date"] = pd.to_datetime(df["test_date"], errors="coerce")
 
+    # Records written before the protocol field existed get one here rather
+    # than on the way out, so a back-filled value is part of the row the editor
+    # compares against and does not show up as an edit nobody made.
+    df["protocol"] = [
+        row["protocol"]
+        if row.get("protocol") in ERG_PROTOCOL_VALUES
+        else infer_protocol(row.get("distance_m"), erg_total_seconds(row))
+        for row in df.to_dict("records")
+    ]
+
     return df
 
 
-def apply_erg_filters(df, profile_id=None, start_date=None, end_date=None, distance=None):
+def apply_erg_filters(df, profile_id=None, start_date=None, end_date=None, protocol=None):
     if df is None or df.empty:
         return df
 
@@ -316,17 +331,17 @@ def apply_erg_filters(df, profile_id=None, start_date=None, end_date=None, dista
     if end_date:
         dff = dff[dff["test_date"] < (pd.to_datetime(end_date) + pd.Timedelta(days=1))]
 
-    if distance not in (None, "", "all"):
-        dff = dff[dff["distance_m"] == pd.to_numeric(distance, errors="coerce")]
+    if protocol not in (None, "", "all"):
+        dff = dff[dff["protocol"] == protocol]
 
     return dff.sort_values(
-        by=["test_date", "profile_id", "distance_m", "row_no"],
+        by=["test_date", "profile_id", "protocol", "row_no"],
         ascending=[False, True, True, True],
         na_position="last",
     )
 
 
-def fetch_erg_data_from_warehouse(profile_id=None, start_date=None, end_date=None, distance=None):
+def fetch_erg_data_from_warehouse(profile_id=None, start_date=None, end_date=None, protocol=None):
     if not ERG_TEST_SOURCE_UUID:
         raise ValueError("ERG_TEST_SOURCE_UUID is not set.")
 
@@ -343,7 +358,7 @@ def fetch_erg_data_from_warehouse(profile_id=None, start_date=None, end_date=Non
         profile_id=profile_id,
         start_date=start_date,
         end_date=end_date,
-        distance=distance,
+        protocol=protocol,
     )
 
 
@@ -464,6 +479,14 @@ def validate_erg_rows(edited_rows):
 
         if to_float(row.get("distance_m")) is None:
             add_issue("distance_m", "Distance is required.")
+
+        if row.get("protocol") not in ERG_PROTOCOL_VALUES:
+            add_issue(
+                "protocol",
+                "Test must be one of "
+                + ", ".join(protocol_label(p) for p in ERG_PROTOCOL_VALUES)
+                + ".",
+            )
 
         for col, (low, high, message) in ERG_NUMERIC_RANGES.items():
             raw_value = strip_sentinel(row.get(col), col)
@@ -642,10 +665,10 @@ layout = dbc.Container(
                             ),
                             html.Br(),
 
-                            dbc.Label("Distance"),
+                            dbc.Label("Test"),
                             dcc.Dropdown(
-                                id="erg-report-distance",
-                                options=ERG_DISTANCE_FILTER_OPTIONS,
+                                id="erg-report-protocol",
+                                options=ERG_PROTOCOL_FILTER_OPTIONS,
                                 value="all",
                                 clearable=False,
                             ),
@@ -707,9 +730,11 @@ layout = dbc.Container(
                             html.Hr(),
                             html.Small(
                                 "Load a range, switch on Edit Data, correct the tinted cells, "
-                                "then review the changes before they reach the warehouse. "
-                                "Athlete and distance identify the record, so the athlete "
-                                "column stays read-only.",
+                                "then review the changes before they reach the warehouse. The "
+                                "athlete column stays read-only. On a 30 min piece the distance "
+                                "is the result, so it is editable like any other measurement; "
+                                "results recorded before the Test column existed are read as a "
+                                "2000 m or 6000 m from their distance.",
                                 className="text-muted",
                             ),
                             html.Hr(),
@@ -739,6 +764,7 @@ layout = dbc.Container(
                                 data=[],
                                 columns=build_table_columns(False),
                                 hidden_columns=["__record_uuid", "profile_id"],
+                                dropdown={"protocol": {"options": ERG_PROTOCOL_OPTIONS}},
                                 editable=True,
                                 page_action="native",
                                 page_size=15,
@@ -820,10 +846,10 @@ def apply_erg_athlete_options(options):
     State("erg-report-athlete", "value"),
     State("erg-report-start-date", "date"),
     State("erg-report-end-date", "date"),
-    State("erg-report-distance", "value"),
+    State("erg-report-protocol", "value"),
     prevent_initial_call=True,
 )
-def load_erg_data(n_clicks, athlete_id, start_date, end_date, distance):
+def load_erg_data(n_clicks, athlete_id, start_date, end_date, protocol):
     if not n_clicks:
         raise PreventUpdate
 
@@ -832,7 +858,7 @@ def load_erg_data(n_clicks, athlete_id, start_date, end_date, distance):
             profile_id=athlete_id,
             start_date=safe_date_str(start_date),
             end_date=safe_date_str(end_date),
-            distance=distance,
+            protocol=protocol,
         )
 
         if df.empty:
