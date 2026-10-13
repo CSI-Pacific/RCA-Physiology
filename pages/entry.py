@@ -1627,7 +1627,7 @@ layout = dbc.Container(
                                                 [
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("Test Type"),
+                                                            dbc.Label("Mode"),
                                                             dbc.RadioItems(
                                                                 id="form-status",
                                                                 options=[
@@ -1647,7 +1647,7 @@ layout = dbc.Container(
                                                     ),
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("Mode"),
+                                                            dbc.Label("Test Type"),
                                                             dbc.RadioItems(
                                                                 id="form-mode",
                                                                 options=[

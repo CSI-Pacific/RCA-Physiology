@@ -1056,7 +1056,7 @@ layout = dbc.Container(
                                                 [
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("Test Type"),
+                                                            dbc.Label("Mode"),
                                                             dcc.Dropdown(
                                                                 id="reporting-test-type",
                                                                 options=[
@@ -1075,7 +1075,7 @@ layout = dbc.Container(
                                                     ),
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("Mode"),
+                                                            dbc.Label("Test Type"),
                                                             dcc.Dropdown(
                                                                 id="reporting-mode",
                                                                 options=[
