@@ -16,7 +16,7 @@ from auth_setup import auth
 from utils import fetch_profiles
 from settings import SITE_URL, VO2_STEP_SOURCE_UUID
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
-from step_protocols import rate_out_of_range, rate_range_message
+from step_protocols import rate_out_of_range, rate_range_message, step_profile
 
 import erg_editor  # registers the Erg Scores tab and its callbacks
 
@@ -475,6 +475,120 @@ def get_changed_cells(original_records, edited_rows):
     return changes
 
 
+# Steps added in the editor have no warehouse record yet. They carry a
+# placeholder uuid so the table's per-row styling and change tracking still
+# have something to key on; it is swapped for the real uuid once created.
+NEW_ROW_PREFIX = "new:"
+
+# A new step with none of these filled in has nothing worth saving.
+STEP_MEASUREMENT_COLUMNS = [
+    "target_po_w", "actual_po_w", "hr_bpm", "lactate_mmol", "vo2", "rate_spm", "rpe", "time_s",
+]
+
+
+def is_new_row(row):
+    return str(row.get("__record_uuid") or "").startswith(NEW_ROW_PREFIX)
+
+
+def get_new_rows(edited_rows):
+    return [row for row in edited_rows or [] if is_new_row(row)]
+
+
+def _is_blank(value):
+    if value is None or value == "":
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def session_key(row):
+    """Which test a step belongs to.
+
+    `session_id` is minted once per submit, so it is the test. Older records
+    without one fall back to athlete + date + type + mode, which is the closest
+    thing they have to an identity.
+    """
+    sid = row.get("session_id")
+    if not _is_blank(sid):
+        return str(sid)
+    profile = to_float(row.get("profile_id"))
+    return "nosession:{}:{}:{}:{}".format(
+        int(profile) if profile is not None else "",
+        safe_date_str(row.get("test_date")) or "",
+        row.get("test_type") or "",
+        row.get("mode") or "",
+    )
+
+
+def build_session_options(records, athlete_options):
+    """One dropdown entry per test currently loaded from the warehouse."""
+    df = normalize_records_to_df(records)
+    if df.empty:
+        return []
+    df = add_athlete_names(df, athlete_options)
+
+    sessions = {}
+    for row in df.to_dict("records"):
+        key = session_key(row)
+        if key not in sessions:
+            sessions[key] = {"row": row, "steps": 0}
+        sessions[key]["steps"] += 1
+
+    def sort_key(item):
+        return safe_date_str(item[1]["row"].get("test_date")) or ""
+
+    options = []
+    for key, info in sorted(sessions.items(), key=sort_key, reverse=True):
+        row = info["row"]
+        label = " | ".join(
+            [
+                str(row.get("athlete_name") or row.get("profile_id") or "Athlete"),
+                safe_date_str(row.get("test_date")) or "Unknown date",
+                str(row.get("test_type") or "—"),
+                str(row.get("mode") or "—"),
+                f"{info['steps']} step(s)",
+            ]
+        )
+        options.append({"label": label, "value": key})
+    return options
+
+
+def build_new_step_row(table_rows, original_records, target_session):
+    """A blank step at the end of `target_session`, carrying its test details.
+
+    Returns (row, insert_at) or (None, None) when the session is not in the table.
+    """
+    session_rows = [
+        (idx, row) for idx, row in enumerate(table_rows or [])
+        if session_key(row) == target_session
+    ]
+    if not session_rows:
+        return None, None
+
+    template = next((row for _, row in session_rows if not is_new_row(row)), session_rows[0][1])
+    step_numbers = [to_float(row.get("step_no")) for _, row in session_rows]
+    step_numbers = [n for n in step_numbers if n is not None]
+    next_step = int(max(step_numbers)) + 1 if step_numbers else 1
+
+    new_row = dict(template)
+    for col in STEP_MEASUREMENT_COLUMNS + ["split_sec_per_500"]:
+        new_row[col] = None
+    new_row["step_no"] = next_step
+    new_row["step_type"] = template.get("step_type") or template.get("mode")
+    new_row["__row_issues"] = ""
+    new_row["__record_uuid"] = f"{NEW_ROW_PREFIX}{datetime.now().strftime('%H%M%S%f')}"
+
+    # The table shows display-formatted timestamps; save the stored ones.
+    original = original_records_by_uuid(original_records).get(str(template.get("__record_uuid")))
+    if original:
+        new_row["session_ts"] = original.get("session_ts")
+        new_row["__dataset_uuid"] = original.get("__dataset_uuid")
+
+    return new_row, session_rows[-1][0] + 1
+
+
 def validate_reporting_rows(edited_rows):
     issues = []
     for idx, row in enumerate(edited_rows or []):
@@ -528,10 +642,14 @@ def validate_reporting_rows(edited_rows):
             if value not in (None, "") and value not in valid_values:
                 add_issue(col, f"{col} should use one of the known options.")
 
+        if is_new_row(row) and all(_is_blank(row.get(col)) for col in STEP_MEASUREMENT_COLUMNS):
+            add_issue("actual_po_w", "New step has no data - fill it in or revert.")
+
     return issues
 
 
-def build_change_summary(changes, issues):
+def build_change_summary(changes, issues, new_rows=None):
+    new_rows = new_rows or []
     if issues:
         issue_rows = [
             html.Li(f"{issue['row_label']} - {issue['message']}")
@@ -546,8 +664,25 @@ def build_change_summary(changes, issues):
             ]
         )
 
-    if not changes:
+    if not changes and not new_rows:
         return html.Div("No editable changes detected.")
+
+    new_row_blocks = []
+    if new_rows:
+        new_row_blocks = [
+            html.P(f"New step(s) to add: {len(new_rows)}", className="mb-1 mt-2"),
+            html.Ul(
+                [
+                    html.Li(
+                        f"{row_label(row)} - PO {display_value(to_float(row.get('actual_po_w')))} W, "
+                        f"HR {display_value(to_float(row.get('hr_bpm')))}, "
+                        f"La {display_value(to_float(row.get('lactate_mmol')))}"
+                    )
+                    for row in new_rows
+                ],
+                className="mb-2",
+            ),
+        ]
 
     grouped = {}
     for change in changes:
@@ -581,8 +716,12 @@ def build_change_summary(changes, issues):
     if len(grouped) > 8:
         blocks.append(html.Div(f"...and {len(grouped) - 8} more changed row(s)."))
 
+    if not changes:
+        return html.Div(new_row_blocks)
+
     return html.Div(
         [
+            *new_row_blocks,
             html.P(f"Ready to update {len(grouped)} row(s), {len(changes)} field change(s)."),
             dbc.Table(
                 html.Thead(html.Tr([html.Th("Field"), html.Th("Current"), html.Th("New")])),
@@ -603,6 +742,14 @@ def build_reporting_table_styles(changes, issues):
         }
         for col in REPORT_EDITABLE_COLUMNS
     ]
+
+    # Steps that only exist in the editor so far.
+    styles.append(
+        {
+            "if": {"filter_query": f'{{__record_uuid}} contains "{NEW_ROW_PREFIX}"'},
+            "backgroundColor": "#e6f4ea",
+        }
+    )
 
     for change in changes:
         styles.append(
@@ -842,6 +989,43 @@ def fetch_single_record_from_dataset(dataset_uuid):
         extra_params={"dataset_uuid": dataset_uuid},
     )
     return records[0] if records else None
+
+def create_step_record(data, dataset_uuid=None):
+    """Create one step record, in the test's own dataset when possible.
+
+    Falls back to a standalone ingest, which still groups with its test because
+    reporting groups by `session_id`, not by dataset.
+    """
+    if dataset_uuid:
+        try:
+            return wc.create_record(data={"dataset": dataset_uuid, "data": data})
+        except WarehouseClientError:
+            pass
+
+    dataset, created_count = wc.ingest_raw(
+        source_uuid=VO2_STEP_SOURCE_UUID,
+        records=[data],
+        subject_field="profile_id",
+        validate_client_side=False,
+    )
+    if created_count != 1:
+        raise WarehouseClientError(f"Ingestion created {created_count} records instead of 1.")
+    record = fetch_single_record_from_dataset(dataset.get("uuid"))
+    if not record:
+        raise WarehouseClientError("Ingestion succeeded but the new record could not be reloaded.")
+    return record
+
+
+def new_row_to_payload(row):
+    payload_row = {col: row.get(col) for col in REPORT_DATA_COLUMNS}
+    # The table shows a formatted split; work it out from power the way entry does.
+    payload_row["split_sec_per_500"] = (
+        estimate_split_seconds(row.get("actual_po_w"))
+        if step_profile(row.get("test_type"))["has_split"]
+        else None
+    )
+    return row_to_warehouse_payload(payload_row)
+
 
 def _extract_record_payload(rec):
     """
@@ -1157,6 +1341,38 @@ layout = dbc.Container(
                                                 ],
                                                 className="mt-2",
                                             ),
+                                            html.Div(
+                                                [
+                                                    dbc.Label("Test", className="mt-3"),
+                                                    dcc.Dropdown(
+                                                        id="reporting-session-select",
+                                                        options=[],
+                                                        placeholder="Select a loaded test...",
+                                                        clearable=True,
+                                                    ),
+                                                    dbc.Button(
+                                                        "Add Step",
+                                                        id="reporting-add-step-btn",
+                                                        color="success",
+                                                        outline=True,
+                                                        className="w-100 mt-2",
+                                                        disabled=True,
+                                                    ),
+                                                    dbc.Button(
+                                                        "Delete Test",
+                                                        id="reporting-delete-test-btn",
+                                                        color="danger",
+                                                        outline=True,
+                                                        className="w-100 mt-2",
+                                                        disabled=True,
+                                                    ),
+                                                    html.Small(
+                                                        "Available in edit mode. New steps are saved with Review Changes.",
+                                                        className="text-muted",
+                                                    ),
+                                                    dcc.ConfirmDialog(id="reporting-delete-confirm"),
+                                                ],
+                                            ),
                                             dcc.Download(id="reporting-download"),
                                             html.Hr(),
                                             dbc.Alert(id="reporting-status-msg", is_open=False),
@@ -1459,7 +1675,7 @@ def update_reporting_edit_controls(edit_mode, table_rows, original_records):
     changes = get_changed_cells(original_records, table_rows)
     issues = validate_reporting_rows(table_rows)
     styles = build_reporting_table_styles(changes, issues)
-    has_changes = bool(changes)
+    has_changes = bool(changes) or bool(get_new_rows(table_rows))
     edit_mode = bool(edit_mode)
 
     return (
@@ -1470,6 +1686,152 @@ def update_reporting_edit_controls(edit_mode, table_rows, original_records):
         not (edit_mode and has_changes),
         not (edit_mode and has_changes),
     )
+
+
+@dash.callback(
+    Output("reporting-session-select", "options"),
+    Output("reporting-session-select", "value"),
+    Input("reporting-data-store", "data"),
+    State("reporting-athlete-options-store", "data"),
+    State("reporting-session-select", "value"),
+)
+def update_session_options(records, athlete_options, current):
+    options = build_session_options(records, athlete_options)
+    keep = current if any(opt["value"] == current for opt in options) else None
+    return options, keep
+
+
+@dash.callback(
+    Output("reporting-add-step-btn", "disabled"),
+    Output("reporting-delete-test-btn", "disabled"),
+    Input("reporting-edit-mode-store", "data"),
+    Input("reporting-session-select", "value"),
+)
+def toggle_session_buttons(edit_mode, session):
+    disabled = not (edit_mode and session)
+    return disabled, disabled
+
+
+@dash.callback(
+    Output("reporting-table", "data", allow_duplicate=True),
+    Output("reporting-update-msg", "children", allow_duplicate=True),
+    Output("reporting-update-msg", "color", allow_duplicate=True),
+    Output("reporting-update-msg", "is_open", allow_duplicate=True),
+    Input("reporting-add-step-btn", "n_clicks"),
+    State("reporting-session-select", "value"),
+    State("reporting-table", "data"),
+    State("reporting-data-store", "data"),
+    prevent_initial_call=True,
+)
+def add_step_to_session(n_clicks, session, table_rows, original_records):
+    if not n_clicks or not session:
+        raise PreventUpdate
+
+    rows = list(table_rows or [])
+    new_row, insert_at = build_new_step_row(rows, original_records, session)
+    if new_row is None:
+        return (
+            no_update,
+            "That test is not in the loaded data - reload and try again.",
+            "warning",
+            True,
+        )
+
+    rows.insert(insert_at, new_row)
+    return (
+        rows,
+        f"Added step {new_row['step_no']} (green row). Fill it in, then Review Changes to save.",
+        "info",
+        True,
+    )
+
+
+@dash.callback(
+    Output("reporting-delete-confirm", "displayed"),
+    Output("reporting-delete-confirm", "message"),
+    Output("reporting-update-msg", "children", allow_duplicate=True),
+    Output("reporting-update-msg", "color", allow_duplicate=True),
+    Output("reporting-update-msg", "is_open", allow_duplicate=True),
+    Input("reporting-delete-test-btn", "n_clicks"),
+    State("reporting-session-select", "value"),
+    State("reporting-session-select", "options"),
+    State("reporting-table", "data"),
+    State("reporting-data-store", "data"),
+    prevent_initial_call=True,
+)
+def ask_before_delete_test(n_clicks, session, options, table_rows, original_records):
+    if not n_clicks or not session:
+        raise PreventUpdate
+
+    # Deleting reloads the table from the store, which would silently drop
+    # anything typed but not yet saved.
+    if get_changed_cells(original_records, table_rows) or get_new_rows(table_rows):
+        return (
+            False,
+            no_update,
+            "Save or revert your unsaved changes before deleting a test.",
+            "warning",
+            True,
+        )
+
+    label = next((opt["label"] for opt in options or [] if opt["value"] == session), session)
+    message = (
+        f"Permanently delete this test from the warehouse?\n\n{label}\n\n"
+        "Every step in it will be removed. This cannot be undone."
+    )
+    return True, message, no_update, no_update, no_update
+
+
+@dash.callback(
+    Output("reporting-data-store", "data", allow_duplicate=True),
+    Output("reporting-update-msg", "children", allow_duplicate=True),
+    Output("reporting-update-msg", "color", allow_duplicate=True),
+    Output("reporting-update-msg", "is_open", allow_duplicate=True),
+    Input("reporting-delete-confirm", "submit_n_clicks"),
+    State("reporting-session-select", "value"),
+    State("reporting-data-store", "data"),
+    prevent_initial_call=True,
+)
+def delete_test(confirm_clicks, session, original_records):
+    if not confirm_clicks or not session:
+        raise PreventUpdate
+
+    records = original_records or []
+    targets = [
+        rec for rec in records
+        if session_key(_extract_record_payload(rec)) == session
+    ]
+    if not targets:
+        return no_update, "That test is no longer loaded - reload and try again.", "warning", True
+
+    deleted = set()
+    error = None
+    for rec in targets:
+        record_uuid = _extract_record_payload(rec).get("__record_uuid")
+        if not record_uuid:
+            continue
+        try:
+            wc.delete_record(record_uuid=str(record_uuid))
+            deleted.add(str(record_uuid))
+        except WarehouseClientError as e:
+            error = str(e)
+            break
+
+    # Keep the store honest about what is actually gone, even on a partial failure.
+    remaining = [
+        rec for rec in records
+        if str(_extract_record_payload(rec).get("__record_uuid")) not in deleted
+    ]
+
+    if error:
+        return (
+            remaining,
+            f"Deleted {len(deleted)} of {len(targets)} step(s), then failed: {error} "
+            "Delete the test again to remove the rest.",
+            "danger",
+            True,
+        )
+    return remaining, f"Deleted test ({len(deleted)} step(s)). You can re-enter it on the Data Entry page.", "success", True
 
 
 @dash.callback(
@@ -1507,8 +1869,9 @@ def toggle_reporting_review_modal(review_clicks, cancel_clicks, is_open, table_r
         raise PreventUpdate
 
     changes = get_changed_cells(original_records, table_rows)
+    new_rows = get_new_rows(table_rows)
     issues = validate_reporting_rows(table_rows)
-    return True, build_change_summary(changes, issues), bool(issues or not changes)
+    return True, build_change_summary(changes, issues, new_rows), bool(issues or not (changes or new_rows))
 
 
 @dash.callback(
@@ -1644,18 +2007,42 @@ def update_warehouse_records(n_clicks, edited_rows, original_records):
     except Exception as e:
         return no_update, f"Unexpected update error: {e}", "danger", True, False
 
-    if not updated_count:
+    # New steps go in one at a time. If one fails, the ones already created are
+    # kept in the store below, so saving again cannot create them twice.
+    created_rows = []
+    create_error = None
+    for new_row in get_new_rows(edited_rows):
+        try:
+            data = new_row_to_payload(new_row)
+            record = create_step_record(data, new_row.get("__dataset_uuid"))
+            created_rows.append(merge_replacement_record(data, record))
+        except Exception as e:
+            create_error = f"Could not add {row_label(new_row)}: {e}"
+            break
+
+    if not updated_count and not created_rows:
+        if create_error:
+            return no_update, create_error, "danger", True, False
         return no_update, "No editable changes detected.", "info", True, False
 
     refreshed = []
     for row in original_df.to_dict("records"):
         record_uuid = str(row.get("__record_uuid")) if row.get("__record_uuid") else None
         refreshed.append(local_updates.get(record_uuid, row))
+    refreshed.extend(created_rows)
+
+    parts = []
+    if updated_count:
+        parts.append(f"Updated {updated_count} warehouse record(s).")
+    if created_rows:
+        parts.append(f"Added {len(created_rows)} new step(s).")
+    if create_error:
+        parts.append(f"{create_error} Any unsaved steps were cleared; add them again.")
 
     return (
         dataframe_to_store_records(pd.DataFrame(refreshed)),
-        f"Updated {updated_count} warehouse record(s).",
-        "success",
+        " ".join(parts),
+        "warning" if create_error else "success",
         True,
         False,
     )
