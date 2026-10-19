@@ -202,6 +202,14 @@ body {
    the open menu to the viewport with position: fixed and flips it above the
    cell when there is no room below; these rules only cover its appearance.
    --------------------------------------------------------- */
+/* A dropdown cell carries the class "dropdown", which Bootstrap 5 makes
+   position: relative. Dash 4's table then measures the open menu against the
+   cell itself instead of the table, decides it is out of view, and sets it to
+   display: none -- the menu opens but is never seen. Keep the cell static. */
+.dash-spreadsheet td.dropdown {
+  position: static;
+}
+
 .dash-table-container .Select-menu-outer {
   background-color: #fff;
   border: 1px solid #adb5bd;

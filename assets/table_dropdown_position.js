@@ -9,6 +9,11 @@
 
    The menu node is left where React put it, so react-select keeps its own
    click handling; only its geometry is taken over here.
+
+   Dash 4's table also positions the open menu (absolute, inside the table)
+   and does so after this script has run, which put the menu straight back
+   inside the clipping table. A style observer on the open menu re-applies
+   the fixed placement whenever the table rewrites it.
    --------------------------------------------------------------------------- */
 (function () {
   "use strict";
@@ -21,6 +26,11 @@
 
   var open = { menu: null, control: null };
   var frame = null;
+  var styleWatch = new MutationObserver(function () {
+    if (open.menu && open.menu.style.getPropertyValue("position") !== "fixed") {
+      schedule();
+    }
+  });
 
   // Re-measuring forces a reflow, so coalesce the scroll and resize bursts
   // into one placement per frame.
@@ -68,6 +78,7 @@
     var left = Math.min(rect.left, Math.max(window.innerWidth - width - GUTTER, GUTTER));
 
     setImportant(menu, {
+      display: "block",
       position: "fixed",
       top: (openUp ? rect.top - height : rect.bottom) + "px",
       left: left + "px",
@@ -85,6 +96,7 @@
   }
 
   function release() {
+    styleWatch.disconnect();
     open.menu = null;
     open.control = null;
     window.removeEventListener("scroll", schedule, true);
@@ -102,6 +114,7 @@
     open.control = control;
     window.addEventListener("scroll", schedule, true);
     window.addEventListener("resize", schedule);
+    styleWatch.observe(menu, { attributes: true, attributeFilter: ["style"] });
     place();
   }
 

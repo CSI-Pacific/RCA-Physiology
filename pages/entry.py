@@ -36,6 +36,8 @@ from bulk_templates import (
 )
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
 from step_protocols import (
+    manual_max_issues,
+    takes_manual_max_results,
     rate_header,
     rate_out_of_range,
     rate_range_message,
@@ -379,6 +381,8 @@ FINGERPRINT_FIELDS = (
     "split_sec_per_500",
     "rpe",
     "time_s",
+    "map_w",
+    "vo2max",
 )
 
 
@@ -1665,6 +1669,53 @@ layout = dbc.Container(
                                                 ],
                                                 className="g-3",
                                             ),
+                                            # Max erg tests only: entered by hand, not derived from the steps.
+                                            html.Div(
+                                                id="form-max-results",
+                                                style={"display": "none"},
+                                                children=[
+                                                    html.Br(),
+                                                    dbc.Row(
+                                                        [
+                                                    dbc.Col(
+                                                        [
+                                                            dbc.Label("MAP (W)"),
+                                                            dbc.Input(
+                                                                id="form-map-w",
+                                                                type="number",
+                                                                min=100,
+                                                                max=1000,
+                                                                step=1,
+                                                                placeholder="optional",
+                                                                value=None,
+                                                                persistence=True,
+                                                                persistence_type=PERSISTENCE_TYPE,
+                                                            ),
+                                                        ],
+                                                        md=6,
+                                                    ),
+                                                    dbc.Col(
+                                                        [
+                                                            dbc.Label("VO2max (L/min)"),
+                                                            dbc.Input(
+                                                                id="form-vo2max",
+                                                                type="number",
+                                                                min=1,
+                                                                max=10,
+                                                                step=0.01,
+                                                                placeholder="optional",
+                                                                value=None,
+                                                                persistence=True,
+                                                                persistence_type=PERSISTENCE_TYPE,
+                                                            ),
+                                                        ],
+                                                        md=6,
+                                                    ),
+                                                        ],
+                                                        className="g-3",
+                                                    ),
+                                                ],
+                                            ),
                                             html.Br(),
                                             dbc.Label("Notes"),
                                             dbc.Textarea(
@@ -2525,6 +2576,15 @@ def ask_before_reset(reset_clicks):
 
 
 @dash.callback(
+    Output("form-max-results", "style"),
+    Input("form-status", "value"),
+    Input("form-mode", "value"),
+)
+def toggle_max_results(test_type, mode):
+    return {"display": "block"} if takes_manual_max_results(test_type, mode) else {"display": "none"}
+
+
+@dash.callback(
     Output("form-name", "value"),
     Output("form-mass", "value"),
     Output("form-test-date", "date"),
@@ -2532,6 +2592,8 @@ def ask_before_reset(reset_clicks):
     Output("form-status", "value"),
     Output("form-mode", "value"),
     Output("form-notes", "value"),
+    Output("form-map-w", "value"),
+    Output("form-vo2max", "value"),
     Output("form-items-table", "data", allow_duplicate=True),
     Output("form-items-table", "selected_rows", allow_duplicate=True),
     Output("form-last-payload", "data", allow_duplicate=True),
@@ -2556,6 +2618,8 @@ def reset_form(confirm_clicks):
         DEFAULT_TEST_TYPE,
         DEFAULT_MODE,
         "",                         # notes
+        None,                       # MAP
+        None,                       # VO2max
         blank_step_rows(),
         [],
         None,                       # last payload
@@ -2579,6 +2643,8 @@ def reset_form(confirm_clicks):
     State("form-status", "value"),
     State("form-mode", "value"),
     State("form-notes", "value"),
+    State("form-map-w", "value"),
+    State("form-vo2max", "value"),
     State("form-items-table", "data"),
     State("form-last-submitted-fingerprint", "data"),
     prevent_initial_call=True,
@@ -2598,11 +2664,25 @@ def submit_form(
     test_type,
     mode,
     notes,
+    map_w,
+    vo2max,
     table_rows,
     last_submission,
 ):
     if not submit_clicks:
         raise PreventUpdate
+
+    # Only a Max erg test carries MAP / VO2max. The fields keep their value
+    # while hidden, so drop them here rather than trust what is on screen.
+    manual_max = {}
+    if takes_manual_max_results(test_type, mode):
+        manual_max = {k: to_float(v) for k, v in (("map_w", map_w), ("vo2max", vo2max))}
+        issues = manual_max_issues(manual_max)
+        if issues:
+            return no_update, no_update, " ".join(issues), "warning", True
+        # Omit blanks: the fields are new to the schema, and leaving them out
+        # keeps a test without them valid either way.
+        manual_max = {k: v for k, v in manual_max.items() if v is not None}
 
     if profile_id is None:
         return no_update, no_update, "Please select an athlete before submitting.", "warning", True
@@ -2643,6 +2723,7 @@ def submit_form(
             "split_sec_per_500": r.get("split"),
             "rpe": r.get("rpe"),
             "time_s": r.get("time_s"),
+            **manual_max,
         })
 
     if not records:
@@ -2689,6 +2770,7 @@ def submit_form(
             "test_type": test_type,
             "mode": mode,
             "notes": (notes or "").strip(),
+            **manual_max,
         },
         "items": table_rows,
         "session_id": session_id,

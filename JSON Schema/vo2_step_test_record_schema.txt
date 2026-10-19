@@ -154,14 +154,6 @@
       "type": ["number", "null"],
       "minimum": 0,
       "description": "Time spent in the step (seconds)."
-    }
-    "test_date": {
-      "type": [
-        "string",
-        "null"
-      ],
-      "format": "date",
-      "description": "Date of test (if added to records in the future)."
     },
     "max_hr_bpm": {
       "type": [
@@ -170,6 +162,22 @@
       ],
       "minimum": 0,
       "description": "Max HR (if added to records in the future)."
+    },
+    "map_w": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Maximal aerobic power (W), entered by hand for a Max erg test. Session-level: repeated on every step record of the test. Omitted when not entered."
+    },
+    "vo2max": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "VO2max (L/min), entered by hand for a Max erg test. Session-level: repeated on every step record of the test. Omitted when not entered."
     }
   }
 }

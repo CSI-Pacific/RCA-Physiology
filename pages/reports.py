@@ -16,7 +16,13 @@ from auth_setup import auth
 from utils import fetch_profiles
 from settings import SITE_URL, VO2_STEP_SOURCE_UUID
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
-from step_protocols import rate_out_of_range, rate_range_message, step_profile
+from step_protocols import (
+    MANUAL_MAX_FIELDS,
+    MANUAL_MAX_RANGES,
+    rate_out_of_range,
+    rate_range_message,
+    step_profile,
+)
 
 import erg_editor  # registers the Erg Scores tab and its callbacks
 
@@ -49,6 +55,8 @@ REPORT_TABLE_COLUMNS = [
     {"name": "Split (s/500)", "id": "split_sec_per_500", "editable": False},
     {"name": "RPE", "id": "rpe", "editable": True},
     {"name": "Time (s)", "id": "time_s", "editable": True},
+    {"name": "MAP (W)", "id": "map_w", "editable": True},
+    {"name": "VO2max (L/min)", "id": "vo2max", "editable": True},
     {"name": "Body Mass", "id": "body_mass_kg", "editable": True},
     {"name": "Notes", "id": "notes", "editable": True},
 ]
@@ -57,9 +65,6 @@ REPORT_DROPDOWN_OPTIONS = {
     "mode": [
         {"label": "Max", "value": "Max"},
         {"label": "Submax", "value": "Submax"},
-        {"label": "Sub Max", "value": "Sub Max"},
-        {"label": "max", "value": "max"},
-        {"label": "submax", "value": "submax"},
     ],
     "test_type": [
         {"label": "Erg C2", "value": "erg_C2"},
@@ -68,6 +73,12 @@ REPORT_DROPDOWN_OPTIONS = {
         {"label": "Bike", "value": "bike"},
         {"label": "Other", "value": "other"},
     ],
+}
+
+# Spellings older records were saved with. They are no longer offered in the
+# dropdown, but a loaded row still holding one must not block saving the table.
+REPORT_LEGACY_DROPDOWN_VALUES = {
+    "mode": {"Sub Max", "max", "submax"},
 }
 
 REPORT_EDITABLE_COLUMNS = {
@@ -89,6 +100,8 @@ REPORT_NUMERIC_COLUMNS = {
     "split_sec_per_500",
     "rpe",
     "time_s",
+    "map_w",
+    "vo2max",
 }
 
 REPORT_INTEGER_COLUMNS = {
@@ -120,6 +133,8 @@ REPORT_DATA_COLUMNS = [
     "split_sec_per_500",
     "rpe",
     "time_s",
+    "map_w",
+    "vo2max",
 ]
 
 REPORT_NON_PAYLOAD_COLUMNS = {"athlete_name", "__row_issues"}
@@ -390,7 +405,12 @@ def clean_cell_value(value, column_id):
 def row_to_warehouse_payload(row):
     payload = {}
     for col in REPORT_DATA_COLUMNS:
-        payload[col] = clean_cell_value(row.get(col), col)
+        value = clean_cell_value(row.get(col), col)
+        # MAP / VO2max are optional and newer than most records; leave them
+        # out rather than write nulls into every record that is edited.
+        if col in MANUAL_MAX_FIELDS and value is None:
+            continue
+        payload[col] = value
     return payload
 
 
@@ -615,6 +635,7 @@ def validate_reporting_rows(edited_rows):
             "rpe": (0, 20, "RPE should be between 0 and 20."),
             "time_s": (0, 7200, "Time should be between 0 and 7200 seconds."),
             "body_mass_kg": (20, 250, "Body mass should be between 20 and 250 kg."),
+            **MANUAL_MAX_RANGES,
         }
 
         for col, (low, high, message) in numeric_ranges.items():
@@ -638,7 +659,7 @@ def validate_reporting_rows(edited_rows):
 
         for col, options in REPORT_DROPDOWN_OPTIONS.items():
             value = row.get(col)
-            valid_values = {opt["value"] for opt in options}
+            valid_values = {opt["value"] for opt in options} | REPORT_LEGACY_DROPDOWN_VALUES.get(col, set())
             if value not in (None, "") and value not in valid_values:
                 add_issue(col, f"{col} should use one of the known options.")
 

@@ -62,3 +62,39 @@ def rate_out_of_range(test_type, value):
     """True when a numeric rate falls outside the test type's bounds."""
     low, high = step_profile(test_type)["rate_range"]
     return value < low or value > high
+
+
+# MAP and VO2max are entered by hand for a maximal erg test, rather than
+# derived from the steps. They are session-level values, carried on every step
+# record of the test the same way body mass and notes are.
+MANUAL_MAX_TEST_TYPES = ("erg_C2", "erg_RP3")
+MANUAL_MAX_FIELDS = ("map_w", "vo2max")
+MANUAL_MAX_RANGES = {
+    "map_w": (100, 1000, "MAP should be between 100 and 1000 W."),
+    "vo2max": (1, 10, "VO2max should be between 1 and 10 L/min."),
+}
+
+
+def is_max_mode(mode):
+    return str(mode or "").strip().lower().replace(" ", "").replace("-", "") == "max"
+
+
+def takes_manual_max_results(test_type, mode):
+    return test_type in MANUAL_MAX_TEST_TYPES and is_max_mode(mode)
+
+
+def manual_max_issues(values):
+    """Range messages for whichever of map_w / vo2max are filled in."""
+    issues = []
+    for field, (low, high, message) in MANUAL_MAX_RANGES.items():
+        raw = values.get(field)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            issues.append(message)
+            continue
+        if value < low or value > high:
+            issues.append(message)
+    return issues
