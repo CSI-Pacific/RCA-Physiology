@@ -16,6 +16,7 @@ from auth_setup import auth
 from utils import fetch_profiles
 from settings import SITE_URL, VO2_STEP_SOURCE_UUID
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
+from lactate_thresholds import compute_hr_zones, lactate_thresholds
 from step_protocols import (
     MANUAL_MAX_FIELDS,
     MANUAL_MAX_RANGES,
@@ -203,66 +204,9 @@ def make_session_label(df):
     dff["session_key"] = dff.apply(_key, axis=1)       # unique grouping key
     return dff
 
-def estimate_power_at_lactate_thresholds(session_df, thresholds=(2, 4, 6), grid_n=400):
-    """
-    Estimate the power (W) at given lactate thresholds using a curve fit of
-    lactate vs actual power within a single session.
-
-    Approach:
-    - Uses quadratic fit if >= 3 unique points
-    - Falls back to linear fit if only 2 unique points
-    - Estimates threshold power from a dense grid within the observed power range
-    - Returns NaN if threshold is outside fitted range
-    """
-    dff = session_df.dropna(subset=["actual_po_w", "lactate_mmol"]).copy()
-
-    if dff.empty:
-        return {f"lt_{int(t)}_w": np.nan for t in thresholds} | {"fit_degree": np.nan, "n_points": 0}
-
-    # collapse duplicate powers to mean lactate
-    dff = (
-        dff.groupby("actual_po_w", as_index=False)["lactate_mmol"]
-        .mean()
-        .sort_values("actual_po_w")
-    )
-
-    x = dff["actual_po_w"].to_numpy(dtype=float)
-    y = dff["lactate_mmol"].to_numpy(dtype=float)
-
-    # need at least 2 unique power points
-    if len(x) < 2 or np.nanmin(x) == np.nanmax(x):
-        return {f"lt_{int(t)}_w": np.nan for t in thresholds} | {"fit_degree": np.nan, "n_points": len(x)}
-
-    # choose fit degree
-    deg = 2 if len(x) >= 3 else 1
-
-    try:
-        coeffs = np.polyfit(x, y, deg=deg)
-        poly = np.poly1d(coeffs)
-    except Exception:
-        return {f"lt_{int(t)}_w": np.nan for t in thresholds} | {"fit_degree": np.nan, "n_points": len(x)}
-
-    grid = np.linspace(np.nanmin(x), np.nanmax(x), grid_n)
-    yhat = poly(grid)
-
-    out = {}
-    yhat_min = np.nanmin(yhat)
-    yhat_max = np.nanmax(yhat)
-
-    for t in thresholds:
-        col = f"lt_{int(t)}_w"
-
-        # only estimate if threshold is within fitted range
-        if t < min(yhat_min, yhat_max) or t > max(yhat_min, yhat_max):
-            out[col] = np.nan
-            continue
-
-        idx = np.nanargmin(np.abs(yhat - t))
-        out[col] = float(grid[idx])
-
-    out["fit_degree"] = deg
-    out["n_points"] = len(x)
-    return out
+def estimate_power_at_lactate_thresholds(session_df, thresholds=(2, 4, 6)):
+    """Power (W) at each lactate threshold for one session; see lactate_thresholds.py."""
+    return lactate_thresholds(session_df["actual_po_w"], session_df["lactate_mmol"], targets=thresholds)
 
 
 def build_lactate_threshold_trend_df(df):
@@ -811,154 +755,68 @@ def build_reporting_table_columns(edit_mode=False):
     return columns
 
 
+def latest_session_rows(df):
+    """Steps of the most recent test in `df` (by test date, then submit time)."""
+    if df is None or df.empty:
+        return df
+    dff = df.copy()
+    dff["__key"] = dff.apply(session_key, axis=1)
+    dff["__date"] = pd.to_datetime(dff.get("test_date"), errors="coerce")
+    dff["__ts"] = pd.to_datetime(dff.get("session_ts"), errors="coerce")
+    order = dff.sort_values(["__date", "__ts"], na_position="first")
+    latest = order["__key"].iloc[-1]
+    return dff[dff["__key"] == latest].drop(columns=["__key", "__date", "__ts"])
+
+
 def compute_report_zones_from_df(df, max_hr_input=None):
+    """HR zones for one test, by the shared method in lactate_thresholds.py.
+
+    Zones only mean something for a single test, so with several tests loaded
+    the most recent one is used (update_reporting_zones says which).
+    """
     if df is None or df.empty:
         return ZONES_DEFAULT_ROWS
 
-    zones_df = df.copy()
+    zones_df = latest_session_rows(df)
     for c in ["hr_bpm", "lactate_mmol", "actual_po_w", "rate_spm"]:
         if c not in zones_df.columns:
             zones_df[c] = None
+        zones_df[c] = pd.to_numeric(zones_df[c], errors="coerce")
 
-    zones_df["hr_bpm"] = pd.to_numeric(zones_df["hr_bpm"], errors="coerce")
-    zones_df["lactate_mmol"] = pd.to_numeric(zones_df["lactate_mmol"], errors="coerce")
-    zones_df["actual_po_w"] = pd.to_numeric(zones_df["actual_po_w"], errors="coerce")
-    zones_df["rate_spm"] = pd.to_numeric(zones_df["rate_spm"], errors="coerce")
-
-    df_la_hr = zones_df.dropna(subset=["lactate_mmol", "hr_bpm"]).copy()
-    if len(df_la_hr) < 2:
+    zones = compute_hr_zones(
+        zones_df["actual_po_w"], zones_df["hr_bpm"], zones_df["lactate_mmol"], max_hr=max_hr_input
+    )
+    if zones is None:
         return ZONES_DEFAULT_ROWS
 
-    if max_hr_input is not None and max_hr_input != "":
-        hr_max = float(max_hr_input)
-    else:
-        hr_max = zones_df["hr_bpm"].max()
-        if pd.isna(hr_max):
-            hr_max = df_la_hr["hr_bpm"].max()
+    test_type = zones_df["test_type"].dropna().iloc[0] if zones_df["test_type"].notna().any() else None
+    has_split = step_profile(test_type)["has_split"]
 
-    hr_max = float(hr_max)
+    def rounded(value, digits):
+        return round(value, digits) if value is not None else None
 
-    d_la_hr = df_la_hr.groupby("lactate_mmol", as_index=False)["hr_bpm"].mean().sort_values("lactate_mmol")
-    la_vals = d_la_hr["lactate_mmol"].to_numpy(dtype=float)
-    hr_vals = d_la_hr["hr_bpm"].to_numpy(dtype=float)
-
-    def hr_at_la(target_la):
-        if target_la <= la_vals.min():
-            return float(hr_vals[0])
-        if target_la >= la_vals.max():
-            return float(hr_vals[-1])
-        return float(np.interp(float(target_la), la_vals, hr_vals))
-
-    df_la_po = zones_df.dropna(subset=["lactate_mmol", "actual_po_w"]).copy()
-    po_at_la_ok = len(df_la_po) >= 2
-    if po_at_la_ok:
-        d_la_po = df_la_po.groupby("lactate_mmol", as_index=False)["actual_po_w"].mean().sort_values("lactate_mmol")
-        la_po_vals = d_la_po["lactate_mmol"].to_numpy(dtype=float)
-        po_vals = d_la_po["actual_po_w"].to_numpy(dtype=float)
-
-        def po_at_la(target_la):
-            if target_la <= la_po_vals.min():
-                return float(po_vals[0])
-            if target_la >= la_po_vals.max():
-                return float(po_vals[-1])
-            return float(np.interp(float(target_la), la_po_vals, po_vals))
-    else:
-        po_at_la = None  # noqa
-
-    def hr_at_po(target_po):
-        return _interp_y_at_x(zones_df, "actual_po_w", "hr_bpm", target_po)
-
-    def po_at_hr(target_hr):
-        return _interp_y_at_x(zones_df, "hr_bpm", "actual_po_w", target_hr)
+    def split(po):
+        return format_split_mmss(estimate_split_seconds(po)) if po is not None and has_split else None
 
     def rate_at_hr(target_hr):
-        return _interp_y_at_x(zones_df, "hr_bpm", "rate_spm", target_hr)
+        return _interp_y_at_x(zones_df, "hr_bpm", "rate_spm", target_hr) if target_hr is not None else None
 
-    def split_from_po(target_po):
-        if target_po is None:
-            return None
-        return format_split_mmss(estimate_split_seconds(target_po))
-
-    def zone_row(zone_code, label, hr_low, hr_high, po_low, po_high, notes=""):
-        rate_low = rate_at_hr(hr_low) if hr_low is not None else None
-        rate_high = rate_at_hr(hr_high) if hr_high is not None else None
-
-        return {
-            "Zone": f"{zone_code}/{label}",
-            "HR_low": round(hr_low, 0) if hr_low is not None else None,
-            "HR_high": round(hr_high, 0) if hr_high is not None else None,
-            "PO_low": round(po_low, 1) if po_low is not None else None,
-            "PO_high": round(po_high, 1) if po_high is not None else None,
-            "Split_low": split_from_po(po_low),
-            "Split_high": split_from_po(po_high),
-            "Rate_low": round(rate_low, 1) if rate_low is not None else None,
-            "Rate_high": round(rate_high, 1) if rate_high is not None else None,
-            "Notes": notes or "",
-        }
-
-    LA_LOW_C6 = 1.5
-    LA_2 = 2.0
-    LA_4 = 4.0
-
-    hr_15 = hr_at_la(LA_LOW_C6)
-    hr_2 = hr_at_la(LA_2)
-    hr_4 = hr_at_la(LA_4)
-
-    hr_15, hr_2, hr_4 = sorted([hr_15, hr_2, hr_4])
-
-    z1_lo = 100.0
-    z1_hi = hr_15
-    z2_lo = hr_15
-    z2_hi = hr_2
-
-    if not po_at_la_ok:
-        return [
-            zone_row("Z1", "C7", z1_lo, z1_hi, po_at_hr(z1_lo), po_at_hr(z1_hi), notes="HR-based"),
-            zone_row("Z2", "C6", z2_lo, z2_hi, po_at_hr(z2_lo), po_at_hr(z2_hi), notes="HR-based"),
-            zone_row("Z3", "C5", z2_hi, hr_4, po_at_hr(z2_hi), po_at_hr(hr_4), notes="Fallback (no La→PO)"),
-            zone_row("Z4", "C4", None, None, None, None, notes="Fallback (no La→PO)"),
-            zone_row("Z5", "C3", hr_4, (hr_4 + hr_max) / 2.0, po_at_hr(hr_4), None, notes="HR-based"),
-            zone_row("Z6", "C2/C1", (hr_4 + hr_max) / 2.0, hr_max, None, None, notes="HR-based"),
-        ]
-
-    po_2 = float(po_at_la(LA_2))
-    po_4 = float(po_at_la(LA_4))
-    po_lo, po_hi = (po_2, po_4) if po_2 <= po_4 else (po_4, po_2)
-    po_mid = (po_lo + po_hi) / 2.0
-
-    hr_at_po2 = hr_at_po(po_lo)
-    hr_at_pomid = hr_at_po(po_mid)
-    hr_at_po4 = hr_at_po(po_hi)
-
-    if hr_at_po2 is None:
-        hr_at_po2 = hr_2
-    if hr_at_pomid is None:
-        hr_at_pomid = (hr_2 + hr_4) / 2.0
-    if hr_at_po4 is None:
-        hr_at_po4 = hr_4
-
-    z3_po_lo, z3_po_hi = po_lo, po_mid
-    z3_hr_lo, z3_hr_hi = float(hr_at_po2), float(hr_at_pomid)
-
-    z4_po_lo, z4_po_hi = po_mid, po_hi
-    z4_hr_lo, z4_hr_hi = float(hr_at_pomid), float(hr_at_po4)
-
-    z5_hr_lo = hr_4
-    z5_hr_hi = (hr_4 + hr_max) / 2.0
-    z6_hr_lo = z5_hr_hi
-    z6_hr_hi = hr_max
-
-    z5_po_low = po_at_hr(z5_hr_lo)
-    z6_po_low = po_at_hr(z6_hr_lo)
-
-    return [
-        zone_row("Z1", "C7", z1_lo, z1_hi, po_at_hr(z1_lo), po_at_hr(z1_hi), notes="100 bpm -> low C6 (HR@1.5)"),
-        zone_row("Z2", "C6", z2_lo, z2_hi, po_at_hr(z2_lo), po_at_hr(z2_hi), notes="1.5-2 mmol HR"),
-        zone_row("Z3", "C5", z3_hr_lo, z3_hr_hi, z3_po_lo, z3_po_hi, notes="2 mmol W -> midpoint (2-4 mmol W)"),
-        zone_row("Z4", "C4", z4_hr_lo, z4_hr_hi, z4_po_lo, z4_po_hi, notes="Midpoint -> 4 mmol W"),
-        zone_row("Z5", "C3", z5_hr_lo, z5_hr_hi, z5_po_low, None, notes="4 mmol HR -> halfway to max HR"),
-        zone_row("Z6", "C2/C1", z6_hr_lo, z6_hr_hi, z6_po_low, None, notes="Halfway -> max HR"),
-    ]
+    rows = []
+    for z in zones:
+        rate_low, rate_high = rate_at_hr(z["HR_low"]), rate_at_hr(z["HR_high"])
+        rows.append({
+            "Zone": z["Zone"],
+            "HR_low": rounded(z["HR_low"], 0),
+            "HR_high": rounded(z["HR_high"], 0),
+            "PO_low": rounded(z["PO_low"], 1),
+            "PO_high": rounded(z["PO_high"], 1),
+            "Split_low": split(z["PO_low"]),
+            "Split_high": split(z["PO_high"]),
+            "Rate_low": rounded(rate_low, 1),
+            "Rate_high": rounded(rate_high, 1),
+            "Notes": z["Notes"],
+        })
+    return rows
 
 
 def dataframe_to_store_records(df):
@@ -1481,6 +1339,7 @@ layout = dbc.Container(
                                                 style_header={"fontWeight": "600"},
                                             ),
                                         ),
+                                        html.Small(id="reporting-zones-source", className="text-muted"),
                                     ],
                                     md=9,
                                 ),
@@ -1658,12 +1517,26 @@ def update_reporting_table(records, athlete_options):
 
 @dash.callback(
     Output("reporting-zones-table", "data"),
+    Output("reporting-zones-source", "children"),
     Input("reporting-table", "data"),
     Input("reporting-max-hr", "value"),
+    State("reporting-athlete-options-store", "data"),
 )
-def update_reporting_zones(table_rows, max_hr_input):
+def update_reporting_zones(table_rows, max_hr_input, athlete_options):
     df = normalize_records_to_df(table_rows)
-    return compute_report_zones_from_df(df, max_hr_input)
+    if df.empty:
+        return ZONES_DEFAULT_ROWS, ""
+
+    latest = add_athlete_names(latest_session_rows(df), athlete_options).iloc[0]
+    n_tests = df.apply(session_key, axis=1).nunique()
+    source = (
+        f"Zones from {latest.get('athlete_name') or 'athlete'}'s test on "
+        f"{safe_date_str(latest.get('test_date')) or 'unknown date'} "
+        f"({latest.get('mode') or 'mode unknown'})"
+    )
+    if n_tests > 1:
+        source += f" - the most recent of the {n_tests} tests loaded. Narrow the filters and reload to see another."
+    return compute_report_zones_from_df(df, max_hr_input), source
 
 
 @dash.callback(

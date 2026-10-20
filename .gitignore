@@ -16,3 +16,6 @@ env/
 .DS_Store
 .ipynb_checkpoints/
 .pytest_cache/
+
+# Local record backups from scripts/backup_step_records.py (athlete data)
+backups/

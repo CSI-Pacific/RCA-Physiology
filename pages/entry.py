@@ -35,6 +35,7 @@ from bulk_templates import (
     step_template_csv,
 )
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
+from lactate_thresholds import LA_2, LA_4, compute_hr_zones, fit_lactate_curve, power_at_lactate
 from step_protocols import (
     manual_max_issues,
     takes_manual_max_results,
@@ -982,28 +983,6 @@ def estimate_split_seconds(power_w):
         return None
     pace = 500.0 * ((2.8 / p) ** (1.0 / 3.0))
     return round(pace, 2)
-
-
-def add_poly_fit(fig, x, y, degree=2, name="Fit", color="red"):
-    if len(x) < degree + 1:
-        return fig
-
-    coeffs = np.polyfit(x, y, degree)
-    poly = np.poly1d(coeffs)
-
-    x_fit = np.linspace(min(x), max(x), 100)
-    y_fit = poly(x_fit)
-
-    fig.add_trace(
-        go.Scatter(
-            x=x_fit,
-            y=y_fit,
-            mode="lines",
-            name=name,
-            line=dict(dash="solid", color=color),
-        )
-    )
-    return fig
 
 
 def format_split_mmss(split_seconds):
@@ -2859,15 +2838,25 @@ def update_plots(rows):
     fig_la.update_layout(margin=dict(l=20, r=20, t=50, b=20))
     fig_la.update_traces(marker=dict(color="blue"))
 
-    if len(df_la) >= 3:
-        fig_la = add_poly_fit(
-            fig_la,
-            df_la["A_PO"].values,
-            df_la["La"].values,
-            degree=2,
-            name="La Power Fit",
-            color="blue",
+    # The same fit, and the same threshold powers, the zones table uses.
+    curve = fit_lactate_curve(df_la["A_PO"], df_la["La"]) if len(df_la) >= 3 else None
+    if curve is not None:
+        x_fit = np.linspace(curve["lo"], curve["hi"], 200)
+        fig_la.add_trace(
+            go.Scatter(x=x_fit, y=curve["poly"](x_fit), mode="lines", name="La Power Fit", line=dict(color="blue"))
         )
+        for target, color in ((LA_2, "#2ca02c"), (LA_4, "#d62728")):
+            po = power_at_lactate(curve, target)
+            if po is None:
+                continue
+            fig_la.add_trace(
+                go.Scatter(
+                    x=[po], y=[target], mode="markers+text",
+                    marker=dict(size=11, color=color, symbol="diamond"),
+                    text=[f"{target:g} mmol: {po:.0f} W"], textposition="top left",
+                    name=f"{target:g} mmol threshold",
+                )
+            )
 
     fig_hr = px.scatter(
         df_hr,
@@ -2910,156 +2899,50 @@ def update_plots(rows):
     Input("form-status", "value"),
 )
 def compute_zones(step_rows, max_hr_input, test_type):
+    """HR zones from this test, by the shared method in lactate_thresholds.py --
+    the same 2 / 4 mmol powers that are marked on the lactate plot."""
     has_split = step_profile(test_type)["has_split"]
-    step_rows = step_rows or []
-    df = pd.DataFrame(step_rows)
-
+    df = pd.DataFrame(step_rows or [])
     if df.empty:
         return ZONES_DEFAULT_ROWS
 
     for c in ["HR", "La", "A_PO", "rate"]:
         if c not in df.columns:
             df[c] = None
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["HR"] = pd.to_numeric(df["HR"], errors="coerce")
-    df["La"] = pd.to_numeric(df["La"], errors="coerce")
-    df["A_PO"] = pd.to_numeric(df["A_PO"], errors="coerce")
-    df["rate"] = pd.to_numeric(df["rate"], errors="coerce")
-
-    df_la_hr = df.dropna(subset=["La", "HR"]).copy()
-    if len(df_la_hr) < 2:
+    zones = compute_hr_zones(df["A_PO"], df["HR"], df["La"], max_hr=max_hr_input)
+    if zones is None:
         return ZONES_DEFAULT_ROWS
-
-    if max_hr_input is not None and max_hr_input != "":
-        hr_max = float(max_hr_input)
-    else:
-        hr_max = df["HR"].max()
-        if pd.isna(hr_max):
-            hr_max = df_la_hr["HR"].max()
-
-    hr_max = float(hr_max)
-
-    d_la_hr = df_la_hr.groupby("La", as_index=False)["HR"].mean().sort_values("La")
-    la_vals = d_la_hr["La"].to_numpy(dtype=float)
-    hr_vals = d_la_hr["HR"].to_numpy(dtype=float)
-
-    def hr_at_la(target_la):
-        if target_la <= la_vals.min():
-            return float(hr_vals[0])
-        if target_la >= la_vals.max():
-            return float(hr_vals[-1])
-        return float(np.interp(float(target_la), la_vals, hr_vals))
-
-    df_la_po = df.dropna(subset=["La", "A_PO"]).copy()
-    po_at_la_ok = len(df_la_po) >= 2
-    if po_at_la_ok:
-        d_la_po = df_la_po.groupby("La", as_index=False)["A_PO"].mean().sort_values("La")
-        la_po_vals = d_la_po["La"].to_numpy(dtype=float)
-        po_vals = d_la_po["A_PO"].to_numpy(dtype=float)
-
-        def po_at_la(target_la):
-            if target_la <= la_po_vals.min():
-                return float(po_vals[0])
-            if target_la >= la_po_vals.max():
-                return float(po_vals[-1])
-            return float(np.interp(float(target_la), la_po_vals, po_vals))
-    else:
-        po_at_la = None  # noqa
-
-    def hr_at_po(target_po):
-        return _interp_y_at_x(df, "A_PO", "HR", target_po)
-
-    def po_at_hr(target_hr):
-        return _interp_y_at_x(df, "HR", "A_PO", target_hr)
 
     def rate_at_hr(target_hr):
         return _interp_y_at_x(df, "HR", "rate", target_hr)
 
-    def split_from_po(target_po):
-        if target_po is None or not has_split:
-            return None
-        return format_split_mmss(estimate_split_seconds(target_po))
+    return [format_zone_row(z, rate_at_hr, has_split) for z in zones]
 
-    def zone_row(zone_code, label, hr_low, hr_high, po_low, po_high, notes=""):
-        rate_low = rate_at_hr(hr_low) if hr_low is not None else None
-        rate_high = rate_at_hr(hr_high) if hr_high is not None else None
 
-        return {
-            "Zone": f"{zone_code}/{label}",
-            "HR_low": round(hr_low, 0) if hr_low is not None else None,
-            "HR_high": round(hr_high, 0) if hr_high is not None else None,
-            "PO_low": round(po_low, 1) if po_low is not None else None,
-            "PO_high": round(po_high, 1) if po_high is not None else None,
-            "Split_low": split_from_po(po_low),
-            "Split_high": split_from_po(po_high),
-            "Rate_low": round(rate_low, 1) if rate_low is not None else None,
-            "Rate_high": round(rate_high, 1) if rate_high is not None else None,
-            "Notes": notes or "",
-        }
+def format_zone_row(zone, rate_at_hr, has_split):
+    """Round a shared zone row for the table and add split and rate."""
+    def rounded(value, digits):
+        return round(value, digits) if value is not None else None
 
-    LA_LOW_C6 = 1.5
-    LA_2 = 2.0
-    LA_4 = 4.0
+    def split(po):
+        return format_split_mmss(estimate_split_seconds(po)) if po is not None and has_split else None
 
-    hr_15 = hr_at_la(LA_LOW_C6)
-    hr_2 = hr_at_la(LA_2)
-    hr_4 = hr_at_la(LA_4)
-
-    hr_15, hr_2, hr_4 = sorted([hr_15, hr_2, hr_4])
-
-    z1_lo = 100.0
-    z1_hi = hr_15
-    z2_lo = hr_15
-    z2_hi = hr_2
-
-    if not po_at_la_ok:
-        return [
-            zone_row("Z1", "C7", z1_lo, z1_hi, po_at_hr(z1_lo), po_at_hr(z1_hi), notes="HR-based"),
-            zone_row("Z2", "C6", z2_lo, z2_hi, po_at_hr(z2_lo), po_at_hr(z2_hi), notes="HR-based"),
-            zone_row("Z3", "C5", z2_hi, hr_4, po_at_hr(z2_hi), po_at_hr(hr_4), notes="Fallback (no La→PO)"),
-            zone_row("Z4", "C4", None, None, None, None, notes="Fallback (no La→PO)"),
-            zone_row("Z5", "C3", hr_4, (hr_4 + hr_max) / 2.0, po_at_hr(hr_4), None, notes="HR-based"),
-            zone_row("Z6", "C2/C1", (hr_4 + hr_max) / 2.0, hr_max, None, None, notes="HR-based"),
-        ]
-
-    po_2 = float(po_at_la(LA_2))
-    po_4 = float(po_at_la(LA_4))
-    po_lo, po_hi = (po_2, po_4) if po_2 <= po_4 else (po_4, po_2)
-    po_mid = (po_lo + po_hi) / 2.0
-
-    hr_at_po2 = hr_at_po(po_lo)
-    hr_at_pomid = hr_at_po(po_mid)
-    hr_at_po4 = hr_at_po(po_hi)
-
-    if hr_at_po2 is None:
-        hr_at_po2 = hr_2
-    if hr_at_pomid is None:
-        hr_at_pomid = (hr_2 + hr_4) / 2.0
-    if hr_at_po4 is None:
-        hr_at_po4 = hr_4
-
-    z3_po_lo, z3_po_hi = po_lo, po_mid
-    z3_hr_lo, z3_hr_hi = float(hr_at_po2), float(hr_at_pomid)
-
-    z4_po_lo, z4_po_hi = po_mid, po_hi
-    z4_hr_lo, z4_hr_hi = float(hr_at_pomid), float(hr_at_po4)
-
-    z5_hr_lo = hr_4
-    z5_hr_hi = (hr_4 + hr_max) / 2.0
-    z6_hr_lo = z5_hr_hi
-    z6_hr_hi = hr_max
-
-    z5_po_low = po_at_hr(z5_hr_lo)
-    z6_po_low = po_at_hr(z6_hr_lo)
-
-    return [
-        zone_row("Z1", "C7", z1_lo, z1_hi, po_at_hr(z1_lo), po_at_hr(z1_hi), notes="100 bpm → low C6 (HR@1.5)"),
-        zone_row("Z2", "C6", z2_lo, z2_hi, po_at_hr(z2_lo), po_at_hr(z2_hi), notes="1.5–2 mmol HR"),
-        zone_row("Z3", "C5", z3_hr_lo, z3_hr_hi, z3_po_lo, z3_po_hi, notes="2 mmol W → midpoint (2–4 mmol W)"),
-        zone_row("Z4", "C4", z4_hr_lo, z4_hr_hi, z4_po_lo, z4_po_hi, notes="Midpoint → 4 mmol W"),
-        zone_row("Z5", "C3", z5_hr_lo, z5_hr_hi, z5_po_low, None, notes="4 mmol HR → halfway to max HR"),
-        zone_row("Z6", "C2/C1", z6_hr_lo, z6_hr_hi, z6_po_low, None, notes="Halfway → max HR"),
-    ]
+    rate_low = rate_at_hr(zone["HR_low"]) if zone["HR_low"] is not None else None
+    rate_high = rate_at_hr(zone["HR_high"]) if zone["HR_high"] is not None else None
+    return {
+        "Zone": zone["Zone"],
+        "HR_low": rounded(zone["HR_low"], 0),
+        "HR_high": rounded(zone["HR_high"], 0),
+        "PO_low": rounded(zone["PO_low"], 1),
+        "PO_high": rounded(zone["PO_high"], 1),
+        "Split_low": split(zone["PO_low"]),
+        "Split_high": split(zone["PO_high"]),
+        "Rate_low": rounded(rate_low, 1),
+        "Rate_high": rounded(rate_high, 1),
+        "Notes": zone["Notes"],
+    }
 
 
 @dash.callback(
