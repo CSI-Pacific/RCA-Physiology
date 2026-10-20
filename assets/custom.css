@@ -210,6 +210,28 @@ body {
   position: static;
 }
 
+/* The selected cell. Dash's default is a pink fill with a hot-pink border,
+   set inline -- hence !important -- which reads as an error highlight and
+   clashes with the red used for out-of-range values. */
+.dash-spreadsheet td.dash-cell.focused,
+.dash-spreadsheet td.dash-cell.cell--selected {
+  background-color: #eef5ff !important;
+  border: 1px solid #0d6efd !important;
+  box-shadow: inset 0 0 0 1px #0d6efd;
+}
+
+/* While editing, show an ordinary text caret. */
+.dash-spreadsheet td.dash-cell input.dash-cell-value.focused {
+  cursor: text;
+  caret-color: #0d6efd;
+}
+
+/* The cell input is always right-aligned, so in a left-aligned table the
+   value jumped sideways as soon as it was clicked. Follow the column. */
+.dash-spreadsheet td.dash-cell input.dash-cell-value {
+  text-align: inherit !important;
+}
+
 .dash-table-container .Select-menu-outer {
   background-color: #fff;
   border: 1px solid #adb5bd;
