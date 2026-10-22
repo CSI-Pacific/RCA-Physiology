@@ -98,3 +98,8 @@ def manual_max_issues(values):
         if value < low or value > high:
             issues.append(message)
     return issues
+
+
+def is_submax_test(mode):
+    """Accept current and legacy spellings; unknown intensity is not eligible."""
+    return str(mode or "").strip().lower().replace(" ", "").replace("-", "") == "submax"

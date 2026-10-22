@@ -37,6 +37,7 @@ from bulk_templates import (
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
 from lactate_thresholds import LA_2, LA_4, compute_hr_zones, fit_lactate_curve, power_at_lactate
 from step_protocols import (
+    is_submax_test,
     manual_max_issues,
     takes_manual_max_results,
     rate_header,
@@ -100,11 +101,11 @@ def blank_step_rows(n=DEFAULT_STEP_ROW_COUNT, mode=DEFAULT_MODE):
 TABLE_COLUMNS = [
     {"name": "Step Number", "id": "step_no", "type": "numeric"},
     {"name": "Submax/Max", "id": "Type", "type": "text"},
-    {"name": "Target PO", "id": "T_PO", "type": "numeric"},
-    {"name": "Actual PO", "id": "A_PO", "type": "numeric"},
-    {"name": "Heart Rate", "id": "HR", "type": "numeric"},
-    {"name": "Blood Lactate", "id": "La", "type": "numeric"},
-    {"name": "V02", "id": "V02", "type": "numeric"},
+    {"name": "Target power (W)", "id": "T_PO", "type": "numeric"},
+    {"name": "Power (W)", "id": "A_PO", "type": "numeric"},
+    {"name": "HR (bpm)", "id": "HR", "type": "numeric"},
+    {"name": "Lactate (mmol/L)", "id": "La", "type": "numeric"},
+    {"name": "VO₂ (L/min)", "id": "V02", "type": "numeric"},
     {"name": "Rate", "id": "rate", "type": "numeric"},
     {"name": "Split time", "id": "split", "type": "numeric", "editable": False},
     {"name": "RPE", "id": "rpe", "type": "numeric"},
@@ -1465,7 +1466,7 @@ layout = dbc.Container(
                     html.Div("PHYSIOLOGY", className="page-eyebrow"),
                     html.H1("Data Entry", className="mb-1"),
                     html.P(
-                        "Step test workflow and batch erg entry.",
+                        "Enter a test, review the results, and save. Drafts are retained in this tab until you start a new test.",
                         className="text-muted mb-0",
                     ),
                 ]
@@ -1537,7 +1538,7 @@ layout = dbc.Container(
                             [
                                 dbc.Col(
                                     make_card(
-                                        "Entry Fields",
+                                        "Test details",
                                         [
                                             dbc.Row(
                                                 [
@@ -1553,7 +1554,7 @@ layout = dbc.Container(
                                                                 persistence_type=PERSISTENCE_TYPE,
                                                             ),
                                                         ],
-                                                        md=6,
+                                                        md=3,
                                                     ),
                                                     dbc.Col(
                                                         [
@@ -1568,22 +1569,21 @@ layout = dbc.Container(
                                                                 persistence_type=PERSISTENCE_TYPE,
                                                             ),
                                                         ],
-                                                        md=6,
+                                                        md=3,
                                                     ),
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("Test Date"),
-                                                            dcc.DatePickerSingle(
+                                                            dbc.Label("Test Date", html_for="form-test-date"),
+                                                            dbc.Input(
+                                                                type="date",
+                                                                size="sm",
                                                                 id="form-test-date",
-                                                                date=date.today().isoformat(),
-                                                                display_format="YYYY-MM-DD",
-                                                                first_day_of_week=1,
-                                                                clearable=False,
+                                                                value=date.today().isoformat(),
                                                                 persistence=True,
                                                                 persistence_type=PERSISTENCE_TYPE,
                                                             ),
                                                         ],
-                                                        md=6,
+                                                        md=3,
                                                     ),
                                                     dbc.Col(
                                                         [
@@ -1600,7 +1600,7 @@ layout = dbc.Container(
                                                                 persistence_type=PERSISTENCE_TYPE,
                                                             ),
                                                         ],
-                                                        md=6,
+                                                        md=3,
                                                     ),
                                                 ],
                                                 className="g-3",
@@ -1610,7 +1610,7 @@ layout = dbc.Container(
                                                 [
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("Mode"),
+                                                            dbc.Label("Equipment"),
                                                             dbc.RadioItems(
                                                                 id="form-status",
                                                                 options=[
@@ -1630,7 +1630,7 @@ layout = dbc.Container(
                                                     ),
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("Test Type"),
+                                                            dbc.Label("Test intensity"),
                                                             dbc.RadioItems(
                                                                 id="form-mode",
                                                                 options=[
@@ -1709,11 +1709,11 @@ layout = dbc.Container(
                                             dbc.Row(
                                                 [
                                                     dbc.Col(
-                                                        dbc.Button("Submit", id="form-submit", color="primary", className="w-100"),
+                                                        dbc.Button("Save test", id="form-submit", color="primary", className="w-100"),
                                                         md=4,
                                                     ),
                                                     dbc.Col(
-                                                        dbc.Button("Reset", id="form-reset", color="secondary", outline=True, className="w-100"),
+                                                        dbc.Button("New test", id="form-reset", color="secondary", outline=True, className="w-100"),
                                                         md=4,
                                                     ),
                                                     dbc.Col(
@@ -1726,16 +1726,16 @@ layout = dbc.Container(
                                             dcc.Download(id="form-download-csv"),
                                         ],
                                     ),
-                                    md=4,
+                                    md=12,
                                 ),
 
                                 dbc.Col(
                                     make_card(
-                                        "Step Test Table",
+                                        "Test steps",
                                         [
                                             html.Div(
                                                 [
-                                                    dbc.Button("Add row", id="form-add-row", color="success", size="sm", className="me-2"),
+                                                    dbc.Button("Add step", id="form-add-row", color="success", size="sm", className="me-2"),
                                                     dbc.Button("Delete selected", id="form-delete-rows", color="danger", size="sm", outline=True),
                                                 ],
                                                 className="mb-2",
@@ -1754,19 +1754,9 @@ layout = dbc.Container(
                                                 style_cell={"padding": "8px", "fontFamily": "system-ui", "fontSize": 14},
                                                 style_header={"fontWeight": "600"},
                                             ),
-                                            html.Br(),
-                                            dbc.Row(
-                                                [
-                                                    dbc.Col(make_card("Average PO", html.H4(id="form-avg-PO", className="m-0")), md=3),
-                                                    dbc.Col(make_card("Average HR", html.H4(id="form-avg-HR", className="m-0")), md=3),
-                                                    dbc.Col(make_card("Average Rate", html.H4(id="form-avg-rate", className="m-0")), md=3),
-                                                    dbc.Col(make_card("Step Count", html.H4(id="form-row-count", className="m-0")), md=3),
-                                                ],
-                                                className="g-2",
-                                            ),
                                         ],
                                     ),
-                                    md=8,
+                                    md=12,
                                 ),
                             ],
                             className="g-3",
@@ -1793,7 +1783,7 @@ layout = dbc.Container(
 
                         html.Hr(),
                         make_card(
-                            "HR Training Zones (from Lactate Thresholds)",
+                            "HR Training Zones (sub-max tests only)",
                             dash_table.DataTable(
                                 id="zones-table",
                                 data=ZONES_DEFAULT_ROWS,
@@ -1865,7 +1855,7 @@ layout = dbc.Container(
                                                     className="mb-2 w-100",
                                                 ),
                                                 html.Small(
-                                                    "Upload fills the table for review; use Push to Warehouse after checking rows.",
+                                                    "Upload fills the table for review; save after checking rows.",
                                                     className="text-muted",
                                                 ),
                                             ],
@@ -1906,12 +1896,11 @@ layout = dbc.Container(
                                                 ),
                                                 html.Div(
                                                     [
-                                                        dcc.DatePickerSingle(
+                                                        dbc.Input(
+                                                            type="date",
+                                                            size="sm",
                                                             id="erg-date-picker",
-                                                            date=date.today().isoformat(),
-                                                            display_format="YYYY-MM-DD",
-                                                            first_day_of_week=1,
-                                                            clearable=False,
+                                                            value=date.today().isoformat(),
                                                             persistence=True,
                                                             persistence_type=PERSISTENCE_TYPE,
                                                         ),
@@ -1947,7 +1936,7 @@ layout = dbc.Container(
                                                 html.Div(
                                                     [
                                                         dbc.Button("Download CSV", id="erg-download-btn", color="info", size="sm", outline=True),
-                                                        dbc.Button("Push to Warehouse", id="erg-submit", color="primary", size="sm"),
+                                                        dbc.Button("Save tests", id="erg-submit", color="primary", size="sm"),
                                                     ],
                                                     className="erg-toolbar-group",
                                                 ),
@@ -2167,7 +2156,6 @@ layout = dbc.Container(
                                 dbc.Row(
                                     [
                                         dbc.Col(make_card("Rows", html.H4(id="erg-row-count", className="m-0")), md=3),
-                                        dbc.Col(make_card("Avg Power", html.H4(id="erg-avg-power", className="m-0")), md=3),
                                         dbc.Col(make_card("Avg Rate", html.H4(id="erg-avg-rate", className="m-0")), md=3),
                                         dbc.Col(make_card("Total Time", html.H4(id="erg-total-time", className="m-0")), md=3),
                                     ],
@@ -2218,7 +2206,7 @@ layout = dbc.Container(
                                                 ),
                                                 html.Small(
                                                     "Nothing is sent until you have read the preview "
-                                                    "and pressed Push.",
+                                                    "and pressed Save tests.",
                                                     className="text-muted",
                                                 ),
                                             ],
@@ -2265,7 +2253,7 @@ layout = dbc.Container(
                                     },
                                 ),
                                 dbc.Button(
-                                    "Push to Warehouse",
+                                    "Save tests",
                                     id="bulk-step-submit",
                                     color="primary",
                                     disabled=True,
@@ -2287,7 +2275,22 @@ layout = dbc.Container(
         ),
     ],
     fluid=True,
+    className="physiology-page entry-page",
 )
+
+
+# Arrange the existing controls in workflow order: setup, steps, save, results.
+_step_tab = layout.children[-1].children[0]
+_setup_body = _step_tab.children[0].children[0].children.children[1]
+_fields = _setup_body.children
+_notes_index = next(i for i, c in enumerate(_fields) if getattr(c, "id", None) == "form-notes")
+_actions = _fields[-2:]
+_setup_body.children = _fields[:_notes_index - 1] + [
+    html.Details([html.Summary("Notes"), _fields[_notes_index]])]
+_step_body = _step_tab.children[0].children[1].children.children[1]
+_step_body.children += [html.Hr(), *_actions]
+_fit_row = _step_tab.children[4]
+_step_tab.children[4] = html.Details([html.Summary("Fit details"), _fit_row])
 
 
 # =========================================================
@@ -2495,33 +2498,6 @@ def restore_table_drafts(_, step_draft, erg_draft):
 
 
 @dash.callback(
-    Output("form-avg-PO", "children"),
-    Output("form-avg-HR", "children"),
-    Output("form-avg-rate", "children"),
-    Output("form-row-count", "children"),
-    Input("form-items-table", "data"),
-    Input("form-status", "value"),
-)
-def update_summary_cards(rows, test_type):
-    rows = rows or []
-
-    po_vals = [to_float(r.get("A_PO")) for r in rows if to_float(r.get("A_PO")) is not None]
-    hr_vals = [to_float(r.get("HR")) for r in rows if to_float(r.get("HR")) is not None]
-    rate_vals = [to_float(r.get("rate")) for r in rows if to_float(r.get("rate")) is not None]
-
-    po_avg = (sum(po_vals) / len(po_vals)) if po_vals else None
-    hr_avg = (sum(hr_vals) / len(hr_vals)) if hr_vals else None
-    rate_avg = (sum(rate_vals) / len(rate_vals)) if rate_vals else None
-
-    po_txt = f"{po_avg:.1f} W" if po_avg is not None else "—"
-    hr_txt = f"{hr_avg:.1f} bpm" if hr_avg is not None else "—"
-    rate_unit = step_profile(test_type)["rate_unit"]
-    rate_txt = f"{rate_avg:.1f} {rate_unit}".rstrip() if rate_avg is not None else "—"
-
-    return po_txt, hr_txt, rate_txt, str(len(rows))
-
-
-@dash.callback(
     Output("form-items-table", "data", allow_duplicate=True),
     Input("form-items-table", "data_timestamp"),
     Input("form-status", "value"),
@@ -2566,7 +2542,7 @@ def toggle_max_results(test_type, mode):
 @dash.callback(
     Output("form-name", "value"),
     Output("form-mass", "value"),
-    Output("form-test-date", "date"),
+    Output("form-test-date", "value"),
     Output("form-max-hr", "value"),
     Output("form-status", "value"),
     Output("form-mode", "value"),
@@ -2618,7 +2594,7 @@ def reset_form(confirm_clicks):
     Input("form-submit", "n_clicks"),
     State("form-name", "value"),
     State("form-mass", "value"),
-    State("form-test-date", "date"),
+    State("form-test-date", "value"),
     State("form-status", "value"),
     State("form-mode", "value"),
     State("form-notes", "value"),
@@ -2631,7 +2607,7 @@ def reset_form(confirm_clicks):
     # slow warehouse call cannot be clicked a second time.
     running=[
         (Output("form-submit", "disabled"), True, False),
-        (Output("form-submit", "children"), "Submitting…", "Submit"),
+        (Output("form-submit", "children"), "Saving…", "Save test"),
         (Output("form-reset", "disabled"), True, False),
     ],
 )
@@ -2774,7 +2750,7 @@ def submit_form(
         return (
             payload,
             submitted,
-            f"Submitted {created} row(s). Dataset UUID: {dataset['uuid']}",
+            html.Div([html.Span(f"Saved {created} steps · {test_date}. "), dcc.Link("View reports", href="/reports")]),
             "success",
             True,
         )
@@ -2897,10 +2873,13 @@ def update_plots(rows):
     Input("form-items-table", "data"),
     Input("form-max-hr", "value"),
     Input("form-status", "value"),
+    Input("form-mode", "value"),
 )
-def compute_zones(step_rows, max_hr_input, test_type):
+def compute_zones(step_rows, max_hr_input, test_type, mode):
     """HR zones from this test, by the shared method in lactate_thresholds.py --
     the same 2 / 4 mmol powers that are marked on the lactate plot."""
+    if not is_submax_test(mode):
+        return [dict(row, Notes="Training zones are only calculated from sub-max tests.") for row in ZONES_DEFAULT_ROWS]
     has_split = step_profile(test_type)["has_split"]
     df = pd.DataFrame(step_rows or [])
     if df.empty:
@@ -2975,7 +2954,7 @@ def download_zones_csv(n_clicks, rows):
     Input("erg-apply-date", "n_clicks"),
     State("erg-items-table", "data"),
     State("erg-items-table", "selected_rows"),
-    State("erg-date-picker", "date"),
+    State("erg-date-picker", "value"),
     State("erg-upload", "filename"),
     State("athlete-options-store", "data"),
     prevent_initial_call=True,
@@ -3041,7 +3020,6 @@ def modify_erg_table(
 
 @dash.callback(
     Output("erg-row-count", "children"),
-    Output("erg-avg-power", "children"),
     Output("erg-avg-rate", "children"),
     Output("erg-total-time", "children"),
     Input("erg-items-table", "data"),
@@ -3051,28 +3029,25 @@ def update_erg_summary(rows):
     df = pd.DataFrame(rows)
 
     if df.empty:
-        return "0", "—", "—", "—"
+        return "0", "—", "—"
 
     for c in ["power_w", "stroke_rate_spm", "time_min", "time_s"]:
         if c not in df.columns:
             df[c] = None
 
-    p = pd.to_numeric(df["power_w"], errors="coerce")
     r = pd.to_numeric(df["stroke_rate_spm"], errors="coerce")
     t_s = pd.to_numeric(df["time_s"], errors="coerce")
     t_min = pd.to_numeric(df["time_min"], errors="coerce")
     t = (t_min.fillna(0) * 60) + t_s.fillna(0)
     t = t.where(t_min.notna() | t_s.notna())
 
-    avg_p = p.mean(skipna=True)
     avg_r = r.mean(skipna=True)
     total_t = t.sum(skipna=True)
 
-    avg_p_txt = f"{avg_p:.1f} W" if pd.notna(avg_p) else "—"
     avg_r_txt = f"{avg_r:.1f} spm" if pd.notna(avg_r) else "—"
     total_t_txt = f"{total_t / 60:.2f} min" if pd.notna(total_t) else "—"
 
-    return str(len(rows)), avg_p_txt, avg_r_txt, total_t_txt
+    return str(len(rows)), avg_r_txt, total_t_txt
 
 
 @dash.callback(
@@ -3273,7 +3248,7 @@ def load_step_bulk_upload(contents, filename, athlete_options):
     if not contents:
         raise PreventUpdate
 
-    idle = (None, [], True, "Push to Warehouse")
+    idle = (None, [], True, "Save tests")
 
     if not athlete_options:
         return (
@@ -3384,3 +3359,11 @@ def push_step_bulk_records(n_clicks, records, last_submission):
         },
         True,
     )
+
+
+@dash.callback(
+    Output("form-download-zones-btn", "disabled"),
+    Input("form-mode", "value"),
+)
+def disable_max_zone_export(mode):
+    return not is_submax_test(mode)

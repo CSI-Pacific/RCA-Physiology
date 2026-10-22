@@ -638,24 +638,24 @@ layout = dbc.Container(
                                 [
                                     dbc.Col(
                                         [
-                                            dbc.Label("Start Date"),
-                                            dcc.DatePickerSingle(
+                                            dbc.Label("Start Date", html_for="erg-report-start-date"),
+                                            dbc.Input(
+                                                type="date",
+                                                size="sm",
                                                 id="erg-report-start-date",
-                                                date=(date.today() - timedelta(days=365)).isoformat(),
-                                                display_format="YYYY-MM-DD",
-                                                clearable=True,
+                                                value=(date.today() - timedelta(days=365)).isoformat(),
                                             ),
                                         ],
                                         md=6,
                                     ),
                                     dbc.Col(
                                         [
-                                            dbc.Label("End Date"),
-                                            dcc.DatePickerSingle(
+                                            dbc.Label("End Date", html_for="erg-report-end-date"),
+                                            dbc.Input(
+                                                type="date",
+                                                size="sm",
                                                 id="erg-report-end-date",
-                                                date=(date.today() + timedelta(days=365)).isoformat(),
-                                                display_format="YYYY-MM-DD",
-                                                clearable=True,
+                                                value=(date.today() + timedelta(days=365)).isoformat(),
                                             ),
                                         ],
                                         md=6,
@@ -751,7 +751,6 @@ layout = dbc.Container(
                             [
                                 dbc.Col(make_card("Rows", html.H4(id="erg-report-rows", className="m-0")), md=3),
                                 dbc.Col(make_card("Athletes", html.H4(id="erg-report-athletes", className="m-0")), md=3),
-                                dbc.Col(make_card("Avg Power", html.H4(id="erg-report-avg-power", className="m-0")), md=3),
                                 dbc.Col(make_card("Avg Split", html.H4(id="erg-report-avg-split", className="m-0")), md=3),
                             ],
                             className="g-2 mb-3",
@@ -844,8 +843,8 @@ def apply_erg_athlete_options(options):
     Output("erg-report-status-msg", "is_open"),
     Input("erg-report-load-btn", "n_clicks"),
     State("erg-report-athlete", "value"),
-    State("erg-report-start-date", "date"),
-    State("erg-report-end-date", "date"),
+    State("erg-report-start-date", "value"),
+    State("erg-report-end-date", "value"),
     State("erg-report-protocol", "value"),
     prevent_initial_call=True,
 )
@@ -881,7 +880,6 @@ def load_erg_data(n_clicks, athlete_id, start_date, end_date, protocol):
     Output("erg-report-table", "data"),
     Output("erg-report-rows", "children"),
     Output("erg-report-athletes", "children"),
-    Output("erg-report-avg-power", "children"),
     Output("erg-report-avg-split", "children"),
     Input("erg-report-data-store", "data"),
     Input(ATHLETE_OPTIONS_STORE, "data"),
@@ -889,12 +887,10 @@ def load_erg_data(n_clicks, athlete_id, start_date, end_date, protocol):
 def update_erg_table(records, athlete_options):
     rows = records_to_table_rows(records, athlete_options)
     if not rows:
-        return [], "0", "0", "—", "—"
+        return [], "0", "0", "—"
 
     df = pd.DataFrame(rows)
 
-    powers = pd.to_numeric(df["power_w"], errors="coerce")
-    avg_power = powers.mean(skipna=True)
 
     splits = [erg_split_seconds(row) for row in rows]
     splits = [s for s in splits if s is not None]
@@ -904,7 +900,6 @@ def update_erg_table(records, athlete_options):
         rows,
         str(len(rows)),
         str(df["profile_id"].dropna().nunique()),
-        f"{avg_power:.0f} W" if pd.notna(avg_power) else "—",
         f"{format_mmss(avg_split)} /500" if avg_split else "—",
     )
 

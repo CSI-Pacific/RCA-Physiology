@@ -18,6 +18,7 @@ from settings import SITE_URL, VO2_STEP_SOURCE_UUID
 from warehouse import WarehouseAPIConfig, WarehouseClient, WarehouseClientError
 from lactate_thresholds import compute_hr_zones, lactate_thresholds
 from step_protocols import (
+    is_submax_test,
     MANUAL_MAX_FIELDS,
     MANUAL_MAX_RANGES,
     rate_out_of_range,
@@ -40,13 +41,13 @@ dash.register_page(__name__, path="/reports", name="Reporting")
 REPORT_TABLE_COLUMNS = [
     {"name": "Record UUID", "id": "__record_uuid", "editable": False},
     {"name": "Row Issues", "id": "__row_issues", "editable": False},
-    {"name": "Test Date", "id": "test_date", "editable": False},
+    {"name": "Test Date", "id": "test_date", "editable": True},
     {"name": "Athlete", "id": "athlete_name", "editable": False},
     {"name": "Athlete ID", "id": "profile_id", "editable": False},
     {"name": "Session ID", "id": "session_id", "editable": False},
     {"name": "Step", "id": "step_no", "editable": False},
-    {"name": "Mode", "id": "mode", "editable": True, "presentation": "dropdown"},
-    {"name": "Test Type", "id": "test_type", "editable": True, "presentation": "dropdown"},
+    {"name": "Test intensity", "id": "mode", "editable": True, "presentation": "dropdown"},
+    {"name": "Equipment", "id": "test_type", "editable": True, "presentation": "dropdown"},
     {"name": "Target PO", "id": "target_po_w", "editable": True},
     {"name": "Actual PO", "id": "actual_po_w", "editable": True},
     {"name": "HR", "id": "hr_bpm", "editable": True},
@@ -601,6 +602,10 @@ def validate_reporting_rows(edited_rows):
             elif rate_out_of_range(row.get("test_type"), value):
                 add_issue("rate_spm", rate_range_message(row.get("test_type")))
 
+        raw_date = row.get("test_date")
+        if not _is_blank(raw_date) and raw_date != "NaT" and safe_date_str(raw_date) is None:
+            add_issue("test_date", "Test date should be a date like 2026-10-22.")
+
         for col, options in REPORT_DROPDOWN_OPTIONS.items():
             value = row.get(col)
             valid_values = {opt["value"] for opt in options} | REPORT_LEGACY_DROPDOWN_VALUES.get(col, set())
@@ -611,6 +616,41 @@ def validate_reporting_rows(edited_rows):
             add_issue("actual_po_w", "New step has no data - fill it in or revert.")
 
     return issues
+
+
+def propagate_session_dates(rows, previous_rows):
+    """Copy an edited test date onto every other step of the same test.
+
+    The date belongs to the test rather than the step, so editing it on one
+    step moves the whole test. Steps are matched on their key from before the
+    edit, since steps without a session_id are keyed partly by date.
+    Returns None when no date was edited.
+    """
+    previous_by_uuid = {
+        str(row.get("__record_uuid")): row for row in previous_rows or [] if row.get("__record_uuid")
+    }
+
+    new_dates = {}
+    for row in rows or []:
+        previous = previous_by_uuid.get(str(row.get("__record_uuid")))
+        if previous is None or row.get("test_date") == previous.get("test_date"):
+            continue
+        new_date = safe_date_str(row.get("test_date"))
+        # Leave an unreadable date on its own row for validation to flag.
+        if new_date is not None:
+            new_dates.setdefault(session_key(previous), new_date)
+
+    if not new_dates:
+        return None
+
+    updated = []
+    for row in rows:
+        previous = previous_by_uuid.get(str(row.get("__record_uuid")), row)
+        key = session_key(previous)
+        if key in new_dates:
+            row = {**row, "test_date": new_dates[key]}
+        updated.append(row)
+    return updated
 
 
 def build_change_summary(changes, issues, new_rows=None):
@@ -768,16 +808,27 @@ def latest_session_rows(df):
     return dff[dff["__key"] == latest].drop(columns=["__key", "__date", "__ts"])
 
 
+def submax_zone_rows(df):
+    """Only whole sessions with a known sub-max intensity can set zones."""
+    if df is None or df.empty or "mode" not in df.columns:
+        return pd.DataFrame()
+    eligible = df["mode"].map(is_submax_test)
+    keys = df.apply(session_key, axis=1)
+    return df[eligible.groupby(keys).transform("all")]
+
+
 def compute_report_zones_from_df(df, max_hr_input=None):
     """HR zones for one test, by the shared method in lactate_thresholds.py.
 
     Zones only mean something for a single test, so with several tests loaded
-    the most recent one is used (update_reporting_zones says which).
+    the most recent eligible sub-max test is used.
     """
     if df is None or df.empty:
         return ZONES_DEFAULT_ROWS
 
-    zones_df = latest_session_rows(df)
+    zones_df = latest_session_rows(submax_zone_rows(df))
+    if zones_df.empty:
+        return ZONES_DEFAULT_ROWS
     for c in ["hr_bpm", "lactate_mmol", "actual_po_w", "rate_spm"]:
         if c not in zones_df.columns:
             zones_df[c] = None
@@ -1088,24 +1139,24 @@ layout = dbc.Container(
                                                 [
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("Start Date"),
-                                                            dcc.DatePickerSingle(
+                                                            dbc.Label("Start Date", html_for="reporting-start-date"),
+                                                            dbc.Input(
+                                                                type="date",
+                                                                size="sm",
                                                                 id="reporting-start-date",
-                                                                date=(date.today() - timedelta(days=365)).isoformat(),
-                                                                display_format="YYYY-MM-DD",
-                                                                clearable=True,
+                                                                value=(date.today() - timedelta(days=365)).isoformat(),
                                                             ),
                                                         ],
                                                         md=6,
                                                     ),
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("End Date"),
-                                                            dcc.DatePickerSingle(
+                                                            dbc.Label("End Date", html_for="reporting-end-date"),
+                                                            dbc.Input(
+                                                                type="date",
+                                                                size="sm",
                                                                 id="reporting-end-date",
-                                                                date=(date.today() + timedelta(days=365)).isoformat(),
-                                                                display_format="YYYY-MM-DD",
-                                                                clearable=True,
+                                                                value=date.today().isoformat(),
                                                             ),
                                                         ],
                                                         md=6,
@@ -1119,7 +1170,7 @@ layout = dbc.Container(
                                                 [
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("Mode"),
+                                                            dbc.Label("Equipment"),
                                                             dcc.Dropdown(
                                                                 id="reporting-test-type",
                                                                 options=[
@@ -1138,7 +1189,7 @@ layout = dbc.Container(
                                                     ),
                                                     dbc.Col(
                                                         [
-                                                            dbc.Label("Test Type"),
+                                                            dbc.Label("Test intensity"),
                                                             dcc.Dropdown(
                                                                 id="reporting-mode",
                                                                 options=[
@@ -1267,8 +1318,6 @@ layout = dbc.Container(
                                             [
                                                 dbc.Col(make_card("Rows", html.H4(id="reporting-rows", className="m-0")), md=3),
                                                 dbc.Col(make_card("Sessions", html.H4(id="reporting-sessions", className="m-0")), md=3),
-                                                dbc.Col(make_card("Avg PO", html.H4(id="reporting-avg-po", className="m-0")), md=3),
-                                                dbc.Col(make_card("Avg HR", html.H4(id="reporting-avg-hr", className="m-0")), md=3),
                                             ],
                                             className="g-2 mb-3",
                                         ),
@@ -1365,13 +1414,13 @@ layout = dbc.Container(
 
                         dbc.Modal(
                             [
-                                dbc.ModalHeader(dbc.ModalTitle("Review Warehouse Changes")),
+                                dbc.ModalHeader(dbc.ModalTitle("Review changes")),
                                 dbc.ModalBody(id="reporting-change-summary"),
                                 dbc.ModalFooter(
                                     [
                                         dbc.Button("Cancel", id="reporting-cancel-update-btn", color="secondary", outline=True),
                                         dbc.Button(
-                                            "Update Warehouse",
+                                            "Save changes",
                                             id="reporting-confirm-update-btn",
                                             color="success",
                                             disabled=True,
@@ -1401,7 +1450,33 @@ layout = dbc.Container(
         ),
     ],
     fluid=True,
+    className="physiology-page reporting-page",
 )
+
+
+# Keep report browsing separate from record maintenance.
+_report_tab = layout.children[-1].children[0]
+_report_row = _report_tab.children[0]
+_filter_body = _report_row.children[0].children.children[1]
+_controls = _filter_body.children
+_edit_button = next(c for c in _controls if getattr(c, "id", None) == "reporting-edit-btn")
+_edit_index = _controls.index(_edit_button)
+_review_controls = _controls[_edit_index + 1]
+_session_controls = _controls[_edit_index + 2]
+_session_label, _session_picker = _session_controls.children[:2]
+_session_label.children = "Test to edit"
+_session_controls.children = _session_controls.children[2:]
+_filter_body.children = (_controls[:_edit_index] + [
+    dbc.Label("Sub-max test for training zones"),
+    dcc.Dropdown(id="reporting-zone-session-select", options=[], clearable=False,
+                 placeholder="No sub-max tests loaded"), html.Hr(),
+    _edit_button, html.Div([_session_label, _session_picker, _review_controls, _session_controls], id="reporting-edit-tools",
+    style={"display": "none"})] + _controls[_edit_index + 3:])
+_results = _report_row.children[1].children
+# Summary, zones, provenance, then the detailed editable records.
+_report_row.children[1].children = [_results[0], _results[3], _results[4], *_report_tab.children[2:4], html.Br(),
+    html.Details([html.Summary("Step data and editing"), _results[1]], open=True)]
+_report_tab.children = [_report_row] + _report_tab.children[4:]
 
 
 # =========================================================
@@ -1446,11 +1521,13 @@ def apply_athlete_options(options):
     Output("reporting-status-msg", "is_open"),
     Input("reporting-load-btn", "n_clicks"),
     State("reporting-athlete", "value"),
-    State("reporting-start-date", "date"),
-    State("reporting-end-date", "date"),
+    State("reporting-start-date", "value"),
+    State("reporting-end-date", "value"),
     State("reporting-test-type", "value"),
     State("reporting-mode", "value"),
     prevent_initial_call=True,
+    running=[(Output("reporting-load-btn", "disabled"), True, False),
+             (Output("reporting-load-btn", "children"), "Loading…", "Apply filters")],
 )
 def load_reporting_data(n_clicks, athlete_id, start_date, end_date, test_type, mode):
     if not n_clicks:
@@ -1486,8 +1563,6 @@ def load_reporting_data(n_clicks, athlete_id, start_date, end_date, test_type, m
     Output("reporting-table", "data"),
     Output("reporting-rows", "children"),
     Output("reporting-sessions", "children"),
-    Output("reporting-avg-po", "children"),
-    Output("reporting-avg-hr", "children"),
     Input("reporting-data-store", "data"),
     State("reporting-athlete-options-store", "data"),
 )
@@ -1495,7 +1570,7 @@ def update_reporting_table(records, athlete_options):
     df = normalize_records_to_df(records)
 
     if df.empty:
-        return [], "0", "0", "—", "—"
+        return [], "0", "0"
 
     df_display = df.copy()
     df_display = add_athlete_names(df_display, athlete_options)
@@ -1506,27 +1581,28 @@ def update_reporting_table(records, athlete_options):
     rows_txt = str(len(df_display))
     sessions_txt = str(df_display["session_id"].dropna().nunique())
 
-    avg_po = df["actual_po_w"].mean(skipna=True)
-    avg_hr = df["hr_bpm"].mean(skipna=True)
 
-    avg_po_txt = f"{avg_po:.1f} W" if pd.notna(avg_po) else "—"
-    avg_hr_txt = f"{avg_hr:.1f} bpm" if pd.notna(avg_hr) else "—"
 
-    return df_display.to_dict("records"), rows_txt, sessions_txt, avg_po_txt, avg_hr_txt
+    return df_display.to_dict("records"), rows_txt, sessions_txt
 
 
 @dash.callback(
     Output("reporting-zones-table", "data"),
     Output("reporting-zones-source", "children"),
-    Input("reporting-table", "data"),
+    Input("reporting-data-store", "data"),
     Input("reporting-max-hr", "value"),
+    Input("reporting-zone-session-select", "value"),
     State("reporting-athlete-options-store", "data"),
 )
-def update_reporting_zones(table_rows, max_hr_input, athlete_options):
-    df = normalize_records_to_df(table_rows)
+def update_reporting_zones(table_rows, max_hr_input, selected_session, athlete_options):
+    df = submax_zone_rows(normalize_records_to_df(table_rows))
     if df.empty:
-        return ZONES_DEFAULT_ROWS, ""
+        return ZONES_DEFAULT_ROWS, "No sub-max tests loaded. Training zones require a sub-max test."
 
+    if selected_session:
+        df = df[df.apply(session_key, axis=1) == selected_session]
+    if df.empty:
+        return ZONES_DEFAULT_ROWS, "Select a loaded sub-max test to view training zones."
     latest = add_athlete_names(latest_session_rows(df), athlete_options).iloc[0]
     n_tests = df.apply(session_key, axis=1).nunique()
     source = (
@@ -1535,7 +1611,7 @@ def update_reporting_zones(table_rows, max_hr_input, athlete_options):
         f"({latest.get('mode') or 'mode unknown'})"
     )
     if n_tests > 1:
-        source += f" - the most recent of the {n_tests} tests loaded. Narrow the filters and reload to see another."
+        source += f" - latest of {n_tests} loaded tests. Select a test to view its zones."
     return compute_report_zones_from_df(df, max_hr_input), source
 
 
@@ -1583,6 +1659,20 @@ def update_reporting_edit_controls(edit_mode, table_rows, original_records):
 
 
 @dash.callback(
+    Output("reporting-table", "data", allow_duplicate=True),
+    Input("reporting-table", "data_timestamp"),
+    State("reporting-table", "data"),
+    State("reporting-table", "data_previous"),
+    prevent_initial_call=True,
+)
+def apply_test_date_to_session(_, table_rows, previous_rows):
+    updated = propagate_session_dates(table_rows, previous_rows)
+    if updated is None:
+        raise PreventUpdate
+    return updated
+
+
+@dash.callback(
     Output("reporting-session-select", "options"),
     Output("reporting-session-select", "value"),
     Input("reporting-data-store", "data"),
@@ -1592,6 +1682,10 @@ def update_reporting_edit_controls(edit_mode, table_rows, original_records):
 def update_session_options(records, athlete_options, current):
     options = build_session_options(records, athlete_options)
     keep = current if any(opt["value"] == current for opt in options) else None
+    if keep is None and records:
+        latest = latest_session_rows(normalize_records_to_df(records))
+        if not latest.empty:
+            keep = session_key(latest.iloc[0])
     return options, keep
 
 
@@ -1960,7 +2054,7 @@ def update_reporting_plots(records, athlete_options):
     empty_fig.update_layout(
         template="plotly_white",
         margin=dict(l=20, r=20, t=50, b=20),
-        title="No data",
+        title="Apply filters to load tests and view results",
     )
 
     if df.empty:
@@ -1974,7 +2068,7 @@ def update_reporting_plots(records, athlete_options):
     empty_fig.update_layout(
         template="plotly_white",
         margin=dict(l=20, r=20, t=50, b=20),
-        title="No data",
+        title="Apply filters to load tests and view results",
     )
 
     if df.empty:
@@ -2316,3 +2410,23 @@ def download_reporting_csv(n_clicks, records):
         type="text/csv",
     )
 
+
+
+@dash.callback(
+    Output("reporting-edit-tools", "style"),
+    Input("reporting-edit-mode-store", "data"),
+)
+def show_reporting_edit_tools(edit_mode):
+    return {} if edit_mode else {"display": "none"}
+
+
+@dash.callback(
+    Output("reporting-zone-session-select", "options"),
+    Output("reporting-zone-session-select", "value"),
+    Input("reporting-data-store", "data"),
+    State("reporting-athlete-options-store", "data"),
+    State("reporting-zone-session-select", "value"),
+)
+def update_zone_session_options(records, athlete_options, current):
+    eligible = submax_zone_rows(normalize_records_to_df(records))
+    return update_session_options(eligible.to_dict("records"), athlete_options, current)
