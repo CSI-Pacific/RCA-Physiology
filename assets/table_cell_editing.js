@@ -125,6 +125,27 @@
     }
   }
 
+  // Dash 4's table saves an edit when the input loses focus, but a click on
+  // another cell moves the selection first and the edit is dropped -- only Tab
+  // and Enter kept a value. Every click now starts an edit, so every value
+  // typed and then clicked away from vanished. Blur the cell being edited
+  // before the table sees the mouse, while it still counts as the active cell.
+  document.addEventListener(
+    "mousedown",
+    function (event) {
+      var editing = document.activeElement;
+      if (
+        editing &&
+        editing.matches &&
+        editing.matches(".dash-spreadsheet " + CELL_INPUT + ".focused") &&
+        !editing.contains(event.target)
+      ) {
+        editing.blur();
+      }
+    },
+    true
+  );
+
   document.addEventListener("click", function (event) {
     // Only a plain single click: leave shift-click range selection and the
     // second click of a double-click (which selects the value) alone.
